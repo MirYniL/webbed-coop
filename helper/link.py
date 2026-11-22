@@ -91,8 +91,11 @@ class Game:
         self.worldmem = mmap.mmap(-1, WORLD_SIZE, tagname=f"Local\\WebbedWorld_{pid}")
         self.lock = asyncio.Lock()
         self.serial = self.word(3) >> 8
+        override = os.environ.get("WEBBED_COOP_PROFILE")  # QA copies with their own save folder
         self.profile = (
-            profile or Path(os.environ["LOCALAPPDATA"]) / "webbed" / "default"
+            profile
+            or (Path(override) if override else None)
+            or Path(os.environ["LOCALAPPDATA"]) / "webbed" / "default"
         )
         self.patch = Path(tempfile.gettempdir()) / f"WebbedCoop-{pid}.tmp"
         self.previous_snapshot = None
@@ -855,7 +858,7 @@ async def link(pid, profile=None):
             # Only Porthole reaches the game port: it listens on loopback alone.
             server = await asyncio.start_server(join, "127.0.0.1", 0)
             local = server.sockets[0].getsockname()[1]
-            game.status(1, "Запускается Porthole…")
+            game.status(1, "Запускается Porthole...")
             tunnel = Porthole(
                 exe,
                 [
@@ -910,7 +913,7 @@ async def link(pid, profile=None):
                     host_ip, port = "127.0.0.1", int(direct)
                 else:
                     exe = need_porthole()
-                    game.status(2, "Подключение через Steam…")
+                    game.status(2, "Подключение через Steam...")
                     tunnel = Porthole(
                         exe,
                         [

@@ -155,12 +155,26 @@ static Val *coop_script(void *self, void *other, Val *ret, int argc, Val **argv)
 enum
 {
     ITEM_HOST,
-    ITEM_JOIN,
+    ITEM_PASTE,
+    ITEM_FIND,
     ITEM_COPY,
     ITEM_LEAVE,
     ITEM_BACK
 };
-static int items[5], itemCount;
+static int items[6], itemCount;
+/* A short message about the button just pressed; it replaces the hint line for a while. */
+static char notice[192];
+static DWORD noticeAt;
+static char copiedFor[192];
+static void say(const char *text)
+{
+    snprintf(notice, sizeof(notice), "%s", text);
+    noticeAt = GetTickCount();
+}
+static int invite_ready(void)
+{
+    return bus->role == HOST && bus->status != CONNECTING && valid_invite(bus->invite);
+}
 static void build_items(void)
 {
     itemCount = 0;
@@ -168,7 +182,8 @@ static void build_items(void)
     {
         if (player && !guestSlot)
             items[itemCount++] = ITEM_HOST;
-        items[itemCount++] = ITEM_JOIN;
+        items[itemCount++] = ITEM_PASTE;
+        items[itemCount++] = ITEM_FIND;
     }
     else if (bus->role == HOST)
     {
@@ -185,41 +200,58 @@ static const char *item_label(int it)
     {
     case ITEM_HOST:
         return T("Открыть мир для друга", "Open world to a friend");
-    case ITEM_JOIN:
-        return T("Войти к другу", "Join a friend");
+    case ITEM_PASTE:
+        return T("Вставить приглашение", "Paste invite");
+    case ITEM_FIND:
+        return T("Найти друга в Steam", "Find a friend on Steam");
     case ITEM_COPY:
         return T("Скопировать приглашение", "Copy invite");
     case ITEM_LEAVE:
-        return bus->role == HOST ? T("Закрыть мир", "Close world") : T("Покинуть мир друга", "Leave friend's world");
+        if (bus->role == HOST)
+            return T("Закрыть мир", "Close world");
+        return bus->status == CONNECTED ? T("Покинуть мир друга", "Leave friend's world") : T("Отменить", "Cancel");
     default:
         return T("Назад", "Back");
     }
 }
-static const char *item_tip(int it)
+/* What is going on right now (line 1) and what to do next (line 2). */
+static void status_lines(const char **head, const char **hint)
 {
-    if (it != ITEM_BACK && bus->status_text[0])
-        return bus->status_text;
-    switch (it)
+    int connected = bus->status == CONNECTED;
+    if (bus->role == HOST)
     {
-    case ITEM_HOST:
-        return T("Друг увидит ваш мир в Steam и войдёт сам. Нужен бесплатный Porthole из Steam",
-                 "Your friend finds your world on Steam and joins. Needs the free Porthole app on Steam");
-    case ITEM_JOIN:
-        return T("Ищет открытый мир друзей в Steam или берёт приглашение из буфера обмена",
-                 "Finds a friend's open world on Steam, or uses an invite from the clipboard");
-    case ITEM_COPY:
-        return T("Для друга, которого нет в списке друзей Steam", "For a friend who is not on your Steam friends list");
-    case ITEM_LEAVE:
-        return T("Сюжет сохраняется у хоста", "The story is saved on the host");
-    default:
-        return "";
+        *head = connected      ? T("Друг в игре", "Your friend is in")
+                : invite_ready() ? T("Мир открыт · ждём друга", "World open · waiting for your friend")
+                                 : T("Запускаю Porthole... (5-20 секунд)", "Starting Porthole... (5-20 seconds)");
+        *hint = connected      ? ""
+                : invite_ready() ? T("Приглашение уже в буфере обмена: вставьте его другу в чат (Ctrl+V)",
+                                     "The invite is on the clipboard: paste it to your friend (Ctrl+V)")
+                                 : "";
     }
+    else if (bus->role == GUEST)
+    {
+        *head = connected             ? T("Вы в мире друга", "You are in your friend's world")
+                : bus->status_text[0] ? bus->status_text
+                                      : T("Подключаюсь...", "Connecting...");
+        *hint = connected ? "" : T("Обычно до 30 секунд", "Usually up to 30 seconds");
+    }
+    else
+    {
+        *head = bus->status_text[0] ? bus->status_text : T("Кооператив выключен", "Co-op is off");
+        *hint = player && !guestSlot
+                    ? T("Хост: «Открыть мир». Гость: скопируйте приглашение и нажмите «Вставить»",
+                        "Host: «Open world». Guest: copy the invite, then «Paste invite»")
+                    : T("Скопируйте приглашение друга (Ctrl+C) и нажмите «Вставить приглашение»",
+                        "Copy your friend's invite (Ctrl+C), then «Paste invite»");
+    }
+    if (notice[0] && GetTickCount() - noticeAt < 10000)
+        *hint = notice;
 }
 static void refresh_sub(void *self, int force)
 {
     build_items();
-    char key[512];
-    snprintf(key, sizeof(key), "%d|%d|%d|%d|%s", bus->role, itemCount, items[0], language, bus->status_text);
+    char key[64];
+    snprintf(key, sizeof(key), "%d|%d|%d|%d|%d", bus->role, bus->status, itemCount, items[0], language);
     if (!force && !strcmp(key, subKey))
         return;
     snprintf(subKey, sizeof(subKey), "%s", key);
@@ -229,7 +261,7 @@ static void refresh_sub(void *self, int force)
     {
         GameString a, b;
         FN(self, array_set, labels, num(i), str(&a, item_label(items[i])));
-        FN(self, array_set, tips, num(i), str(&b, item_tip(items[i])));
+        FN(self, array_set, tips, num(i), str(&b, ""));
         FN(self, array_set, scripts, num(i), num(coopScript));
         FN(self, array_set, types, num(i), num(1));
     }
@@ -254,6 +286,7 @@ static void open_sub(void *self)
         return;
     subId = value(FN(self, instance_create_depth, num(0), num(0), num(mainMenuDepth - 1), num(OBJ_oMenu)));
     subKey[0] = 0;
+    notice[0] = 0;
     refresh_sub(self, 1);
     iset(self, subId, "option_cursor", num(0));
     iset(self, mainMenuId, "active", num(0));
@@ -270,26 +303,57 @@ static void close_sub(void *self)
         restoreControls = 1; /* after Esc is released, or the pause menu would read it too */
     }
 }
+static DWORD lastAction;
 static void sub_action(void *self, int cursor)
 {
     build_items();
+    /* The buttons change under the cursor (Paste becomes Cancel): a double click or a held
+       Enter must not hit the new button straight away. */
+    if (GetTickCount() - lastAction < 700)
+        return;
+    lastAction = GetTickCount();
+    {
+        char line[80];
+        snprintf(line, sizeof(line), "coop: menu item %d of %d", cursor, itemCount);
+        log_line(line);
+    }
     if (cursor < 0 || cursor >= itemCount)
         return;
     switch (items[cursor])
     {
     case ITEM_HOST:
+        copiedFor[0] = 0;
+        bus->status_text[0] = 0;
         start_link(HOST);
         break;
-    case ITEM_JOIN:
-        coop_join();
+    case ITEM_PASTE:
+        if (clipboard_invite())
+        {
+            bus->status_text[0] = 0;
+            say(T("Приглашение найдено", "Invite found"));
+            start_link(GUEST);
+        }
+        else
+            say(T("В буфере обмена нет приглашения: скопируйте его из сообщения друга (Ctrl+C)",
+                  "No invite on the clipboard: copy it from your friend's message (Ctrl+C)"));
+        break;
+    case ITEM_FIND:
+        bus->status_text[0] = 0;
+        coop_find();
         break;
     case ITEM_COPY:
-        clipboard_copy(bus->invite);
-        if (bus->invite[0])
-            snprintf(bus->status_text, 192, "%s", T("Приглашение скопировано", "Invite copied"));
+        if (invite_ready())
+        {
+            clipboard_copy(bus->invite);
+            snprintf(copiedFor, sizeof(copiedFor), "%s", bus->invite);
+            say(T("Скопировано! Вставьте другу в чат (Ctrl+V)", "Copied! Paste it to your friend (Ctrl+V)"));
+        }
+        else
+            say(T("Porthole ещё запускается, подождите пару секунд", "Porthole is still starting, wait a moment"));
         break;
     case ITEM_LEAVE:
         bus->disconnect = 1;
+        say(bus->role == HOST ? T("Мир закрыт", "World closed") : T("Выход...", "Leaving..."));
         break;
     default:
         close_sub(self);
@@ -297,6 +361,14 @@ static void sub_action(void *self, int cursor)
 }
 static void coop_menu_step(void *self)
 {
+    /* The moment Porthole hands out the invite, it goes to the clipboard by itself. */
+    if (invite_ready() && strcmp(copiedFor, bus->invite))
+    {
+        clipboard_copy(bus->invite);
+        snprintf(copiedFor, sizeof(copiedFor), "%s", bus->invite);
+        say(T("Приглашение скопировано: вставьте его другу в чат (Ctrl+V)",
+              "Invite copied: paste it to your friend (Ctrl+V)"));
+    }
     if (pendingFrom >= 0)
     {
         double from = pendingFrom;
@@ -323,19 +395,9 @@ static void coop_menu_step(void *self)
     }
 }
 
-/* Status lines appear the way the game prints its own HUD text, then fade out. */
-static char toastText[192];
-static DWORD toastAt;
-static void coop_toast(void *self)
+/* Text the way the game prints its own HUD lines: pixel font, white with a dark shadow. */
+static void shadow_text(void *self, double x, double y, const char *text, int colour, double alpha)
 {
-    if (strcmp(toastText, bus->status_text))
-    {
-        snprintf(toastText, sizeof(toastText), "%s", bus->status_text);
-        toastAt = GetTickCount();
-    }
-    DWORD age = GetTickCount() - toastAt;
-    if (!toastText[0] || age > 6000)
-        return;
     static int font = -1;
     if (font < 0)
     {
@@ -343,24 +405,53 @@ static void coop_toast(void *self)
         /* The game's own pixel font, with the Cyrillic range the stock menu glyphs use. */
         font = (int)value(FN(self, font_add, str(&family, "CutePixel.ttf"), num(12), num(0), num(0), num(32), num(1105)));
     }
-    double w = value(FN0(self, display_get_gui_width)), h = value(FN0(self, display_get_gui_height));
-    Val oldFont = FN0(self, draw_get_font), colour = FN0(self, draw_get_color), alpha = FN0(self, draw_get_alpha);
+    Val oldFont = FN0(self, draw_get_font), oldColour = FN0(self, draw_get_color), oldAlpha = FN0(self, draw_get_alpha);
     Val ha = FN0(self, draw_get_halign), va = FN0(self, draw_get_valign);
     FN(self, draw_set_font, num(font));
     FN(self, draw_set_halign, num(1));
-    FN(self, draw_set_valign, num(2));
-    FN(self, draw_set_alpha, num(age < 5000 ? 1 : (6000 - age) / 1000.0));
+    FN(self, draw_set_valign, num(0));
+    FN(self, draw_set_alpha, num(alpha));
     GameString t;
-    Val text = str(&t, toastText);
+    Val v = str(&t, text);
     FN(self, draw_set_color, num(0x1a1a24));
-    FN(self, draw_text, num(w * .5 + 1), num(h - 9), text);
-    FN(self, draw_set_color, num(0xffffff));
-    FN(self, draw_text, num(w * .5), num(h - 10), text);
+    FN(self, draw_text, num(x + 1), num(y + 1), v);
+    FN(self, draw_set_color, num(colour));
+    FN(self, draw_text, num(x), num(y), v);
     FN(self, draw_set_font, oldFont);
-    FN(self, draw_set_color, colour);
-    FN(self, draw_set_alpha, alpha);
+    FN(self, draw_set_color, oldColour);
+    FN(self, draw_set_alpha, oldAlpha);
     FN(self, draw_set_halign, ha);
     FN(self, draw_set_valign, va);
+}
+/* In the co-op menu: a status block above the buttons, always visible. In play: one line at the
+   bottom that stays while something is pending (Porthole starting, waiting, connecting) and
+   fades a few seconds after anything else changes. */
+static char toastText[192];
+static DWORD toastAt;
+static void coop_toast(void *self)
+{
+    const char *head, *hint;
+    status_lines(&head, &hint);
+    double w = value(FN0(self, display_get_gui_width)), h = value(FN0(self, display_get_gui_height));
+    if (exists(self, subId))
+    {
+        shadow_text(self, w * .5, h * .16, head, 0xffffff, 1);
+        if (hint[0])
+            shadow_text(self, w * .5, h * .16 + 16, hint, 0xe8d8b8, 1);
+        return;
+    }
+    if (strcmp(toastText, head))
+    {
+        snprintf(toastText, sizeof(toastText), "%s", head);
+        toastAt = GetTickCount();
+    }
+    int pending = bus->role && bus->status != CONNECTED;
+    DWORD age = GetTickCount() - toastAt;
+    if (!bus->role && !bus->status_text[0])
+        return;
+    if (!pending && age > 6000)
+        return;
+    shadow_text(self, w * .5, h - 22, toastText, 0xffffff, pending || age < 5000 ? 1 : (6000 - age) / 1000.0);
 }
 static int install_menu_hook(void)
 {

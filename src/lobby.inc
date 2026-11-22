@@ -21,21 +21,33 @@ static void clipboard_copy(const char *s)
     }
     CloseClipboard();
 }
+/* Finds an invite anywhere in the clipboard text ("вот код: WB3/..." pasted from a chat works too). */
 static int clipboard_invite(void)
 {
     if (!OpenClipboard(NULL))
         return 0;
-    HANDLE h = GetClipboardData(CF_TEXT);
-    char *s = h ? GlobalLock(h) : NULL;
+    HANDLE h = GetClipboardData(CF_UNICODETEXT);
+    const wchar_t *s = h ? GlobalLock(h) : NULL;
     int good = 0;
     if (s)
     {
-        size_t n = strnlen(s, 190);
-        if (n < 190 && valid_invite(s))
+        const wchar_t *at = wcsstr(s, L"WB3/");
+        if (at)
         {
-            memcpy(bus->invite, s, n);
-            bus->invite[n] = 0;
-            good = 1;
+            char code[192];
+            size_t n = 0;
+            while (n < sizeof(code) - 1 && at[n] < 128 &&
+                   (iswalnum(at[n]) || at[n] == L'/' || at[n] == L'-' || at[n] == L'_'))
+            {
+                code[n] = (char)at[n];
+                n++;
+            }
+            code[n] = 0;
+            if (valid_invite(code))
+            {
+                snprintf(bus->invite, sizeof(bus->invite), "%s", code);
+                good = 1;
+            }
         }
         GlobalUnlock(h);
     }
@@ -67,7 +79,7 @@ static void start_link(int role)
     PROCESS_INFORMATION pi = {0};
     if (role == HOST)
         bus->invite[0] = 0;
-    snprintf(bus->status_text, sizeof(bus->status_text), "%s", T("Запускается Porthole…", "Starting Porthole…"));
+    snprintf(bus->status_text, sizeof(bus->status_text), "%s", T("Запускается Porthole...", "Starting Porthole..."));
     bus->role = role;
     bus->status = CONNECTING;
     bus->disconnect = 0;
@@ -83,20 +95,15 @@ static void start_link(int role)
     if (role == GUEST)
         guestSlotPending = 1;
 }
-/* Join: an invite on the clipboard wins, otherwise look for a friend with an open world in Steam. */
-static void coop_join(void)
+/* Looks for a Steam friend whose game advertises an open world (rich presence). */
+static void coop_find(void)
 {
     if (bus->role || discoveryStarted)
         return;
-    if (clipboard_invite())
-    {
-        start_link(GUEST);
-        return;
-    }
     char found[192];
     find_friend_world(found, 1);
     discoveryStarted = GetTickCount();
-    snprintf(bus->status_text, 192, "%s", T("Ищу мир друга в Steam…", "Looking for your friend's world on Steam…"));
+    snprintf(bus->status_text, 192, "%s", T("Ищу открытый мир у друзей в Steam...", "Looking for an open world among Steam friends..."));
 }
 static void menu_input(void *self)
 {
@@ -137,7 +144,8 @@ static void menu_input(void *self)
             snprintf(bus->status_text, 192, "%s",
                      count > 1 ? T("Мир открыли несколько друзей · скопируйте приглашение нужного",
                                    "Several friends are hosting · copy the invite you want")
-                               : T("Друг ещё не открыл мир", "Your friend has not opened a world yet"));
+                               : T("У друзей в Steam нет открытого мира · войдите по приглашению",
+                                   "No open world among Steam friends · join with an invite"));
         discoveryStarted = 0;
     }
 }
