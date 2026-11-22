@@ -1,0 +1,17 @@
+#define V_open 0x18a5f
+#define V_opening 0x18a65
+#define V_page 0x18a74
+#define V_page_width 0x18a78
+#define V_page_height 0x18a76
+#define V_turn_page 0x18cde
+#define V_y_offset 0x18d52
+#define V_map_rooms 0x189e3
+#define V_map_marker_x 0x189de
+#define V_map_marker_y 0x189df
+#define F_camera_get_view_x 0x1233ba0
+#define F_camera_get_view_y 0x1233c00
+#define F_camera_get_view_width 0x1233b40
+#define F_camera_get_view_height 0x12337b0
+#define F_view_get_camera 0x1234290
+#define F_draw_circle_color 0x11d3d10
+#define F_draw_line_width_color 0x11d4340

@@ -1,0 +1,388 @@
+/* "Co-op" lives in Webbed's own menus: an extra entry in the title and pause menu (oMainMenu),
+   and a submenu that is a plain oMenu instance, so the game draws it with its own font, buttons,
+   tooltips, cursor, sounds and slide animation, exactly like Settings. */
+#define V_option_labels 0x18a68
+#define V_option_tooltips 0x18a6a
+#define V_option_scripts 0x18a69
+#define V_option_types 0x18a6b
+#define V_option_cursor 0x18a67
+#define V_controls_active 0x187c6
+#define V_ui_b 0x18ced
+#define F_variable_instance_get 0x11ca130
+#define F_variable_instance_set 0x11ca650
+#define F_instance_exists 0x11ab540
+#define F_array_create 0x117eb40
+#define F_array_get 0x117f090
+#define F_array_length 0x117f2b0
+#define F_asset_get_index 0x1304840
+#define F_draw_sprite_ext 0x11d4a00
+#define F_gpu_set_fog 0x12e9130
+#define F_is_array 0x1180ab0
+#define S_get_translation 0x6f0180
+#define S_draw_text_lang_shadow 0x6edd00
+#define S_open_steam_page 0x515050
+#define OBJ_oMenu 333
+#define OBJ_oMainMenu 334
+#define SPR_sMapMarker 596
+#define SPR_sUIArrow 244
+
+static Event createMainMenu;
+static double mainMenuId = -1, mainMenuDepth, subId = -1, pendingFrom = -1;
+static int pendingCursor, restoreControls, coopScript = -1, language = -1, coopIndex = -1;
+static char subKey[512];
+
+static int russian(void *self)
+{
+    if (language < 0)
+    {
+        if (!self)
+            return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN;
+        Val l = global_get(self, "language");
+        char line[120];
+        if ((l.kind & 0xffffff) == 1 && l.str && l.str->text)
+        {
+            snprintf(line, sizeof(line), "coop: game language '%s'", l.str->text);
+            language = !_strnicmp(l.str->text, "ru", 2) || strstr(l.str->text, "усск") != NULL;
+        }
+        else
+        {
+            snprintf(line, sizeof(line), "coop: game language kind %d value %.1f", l.kind, value(l));
+            language = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN;
+        }
+        log_line(line);
+        drop(&l);
+    }
+    return language;
+}
+static int is_string(Val v)
+{
+    return (v.kind & 0xffffff) == 1 && v.str && v.str->text;
+}
+static Val iget(void *p, double id, const char *name)
+{
+    GameString k;
+    return FN(p, variable_instance_get, num(id), str(&k, name));
+}
+static void iset(void *p, double id, const char *name, Val v)
+{
+    GameString k;
+    FN(p, variable_instance_set, num(id), str(&k, name), v);
+}
+static int exists(void *p, double id)
+{
+    return id >= 0 && value(FN(p, instance_exists, num(id))) != 0;
+}
+/* Tab 0 of a menu option array, rebuilt with `extra` inserted at `at` (at < 0: no insert). */
+static Val tab_with(void *p, Val outer, int at, Val extra)
+{
+    Val inner = FN(p, array_get, outer, num(0));
+    int n = (int)value(FN(p, array_length, inner));
+    Val fresh = FN(p, array_create, num(n + (at >= 0)));
+    for (int i = 0, j = 0; i < n; i++, j++)
+    {
+        if (i == at)
+            FN(p, array_set, fresh, num(j++), extra);
+        Val v = FN(p, array_get, inner, num(i));
+        FN(p, array_set, fresh, num(j), v);
+        drop(&v);
+    }
+    drop(&inner);
+    Val wrap = FN(p, array_create, num(1));
+    FN(p, array_set, wrap, num(0), fresh);
+    drop(&fresh);
+    return wrap;
+}
+static void set_tab(void *p, double id, const char *name, int at, Val extra)
+{
+    Val outer = iget(p, id, name);
+    if (!value(FN(p, is_array, outer)))
+    {
+        drop(&outer);
+        return;
+    }
+    Val wrap = tab_with(p, outer, at, extra);
+    drop(&outer);
+    iset(p, id, name, wrap);
+    drop(&wrap);
+}
+static void coop_script_id(void *self);
+static void on_main_menu_create(void *self, void *other)
+{
+    createMainMenu(self, other);
+    log_line("coop: menu created");
+    language = -1;
+    russian(self);
+    coop_script_id(self);
+    {
+        char line[80];
+        snprintf(line, sizeof(line), "coop: script %d, russian %d", coopScript, language);
+        log_line(line);
+    }
+    if (coopScript < 0)
+        return;
+    mainMenuId = coord(self, B_id);
+    mainMenuDepth = coord(self, B_depth);
+    /* Insert "Co-op" right before "Settings" in the title and pause menus. */
+    Val labels = *field(self, V_option_labels);
+    Val inner = FN(self, array_get, labels, num(0));
+    int n = (int)value(FN(self, array_length, inner)), at = n > 1 ? n - 1 : 0;
+    for (int i = 0; i < n; i++)
+    {
+        Val v = FN(self, array_get, inner, num(i));
+        if (is_string(v) && !strcmp(v.str->text, "Settings"))
+            at = i;
+        drop(&v);
+    }
+    drop(&inner);
+    GameString a, b;
+    coopIndex = at;
+    set_tab(self, mainMenuId, "option_labels", at, str(&a, T("Кооператив", "Co-op")));
+    set_tab(self, mainMenuId, "option_tooltips", at,
+            str(&b, T("Играть вдвоём через Steam: у каждого свой паук, сюжет общий",
+                      "Play together over Steam: a spider each, one shared story")));
+    set_tab(self, mainMenuId, "option_scripts", at, num(coopScript));
+    set_tab(self, mainMenuId, "option_types", at, num(1)); /* 1 = button */
+    clear_texts();
+}
+/* Stand-in for open_steam_page (only the demo build uses it): every co-op button runs this. */
+static Val *coop_script(void *self, void *other, Val *ret, int argc, Val **argv)
+{
+    (void)other, (void)argc, (void)argv;
+    pendingFrom = coord(self, B_id);
+    pendingCursor = (int)read_field(self, V_option_cursor);
+    return ret;
+}
+enum
+{
+    ITEM_HOST,
+    ITEM_JOIN,
+    ITEM_COPY,
+    ITEM_LEAVE,
+    ITEM_BACK
+};
+static int items[5], itemCount;
+static void build_items(void)
+{
+    itemCount = 0;
+    if (!bus->role)
+    {
+        if (player && !guestSlot)
+            items[itemCount++] = ITEM_HOST;
+        items[itemCount++] = ITEM_JOIN;
+    }
+    else if (bus->role == HOST)
+    {
+        items[itemCount++] = ITEM_COPY;
+        items[itemCount++] = ITEM_LEAVE;
+    }
+    else
+        items[itemCount++] = ITEM_LEAVE;
+    items[itemCount++] = ITEM_BACK;
+}
+static const char *item_label(int it)
+{
+    switch (it)
+    {
+    case ITEM_HOST:
+        return T("Открыть мир для друга", "Open world to a friend");
+    case ITEM_JOIN:
+        return T("Войти к другу", "Join a friend");
+    case ITEM_COPY:
+        return T("Скопировать приглашение", "Copy invite");
+    case ITEM_LEAVE:
+        return bus->role == HOST ? T("Закрыть мир", "Close world") : T("Покинуть мир друга", "Leave friend's world");
+    default:
+        return T("Назад", "Back");
+    }
+}
+static const char *item_tip(int it)
+{
+    if (it != ITEM_BACK && bus->status_text[0])
+        return bus->status_text;
+    switch (it)
+    {
+    case ITEM_HOST:
+        return T("Друг увидит ваш мир в Steam и войдёт сам. Нужен бесплатный Porthole из Steam",
+                 "Your friend finds your world on Steam and joins. Needs the free Porthole app on Steam");
+    case ITEM_JOIN:
+        return T("Ищет открытый мир друзей в Steam или берёт приглашение из буфера обмена",
+                 "Finds a friend's open world on Steam, or uses an invite from the clipboard");
+    case ITEM_COPY:
+        return T("Для друга, которого нет в списке друзей Steam", "For a friend who is not on your Steam friends list");
+    case ITEM_LEAVE:
+        return T("Сюжет сохраняется у хоста", "The story is saved on the host");
+    default:
+        return "";
+    }
+}
+static void refresh_sub(void *self, int force)
+{
+    build_items();
+    char key[512];
+    snprintf(key, sizeof(key), "%d|%d|%d|%d|%s", bus->role, itemCount, items[0], language, bus->status_text);
+    if (!force && !strcmp(key, subKey))
+        return;
+    snprintf(subKey, sizeof(subKey), "%s", key);
+    Val labels = FN(self, array_create, num(itemCount)), tips = FN(self, array_create, num(itemCount));
+    Val scripts = FN(self, array_create, num(itemCount)), types = FN(self, array_create, num(itemCount));
+    for (int i = 0; i < itemCount; i++)
+    {
+        GameString a, b;
+        FN(self, array_set, labels, num(i), str(&a, item_label(items[i])));
+        FN(self, array_set, tips, num(i), str(&b, item_tip(items[i])));
+        FN(self, array_set, scripts, num(i), num(coopScript));
+        FN(self, array_set, types, num(i), num(1));
+    }
+    const char *names[] = {"option_labels", "option_tooltips", "option_scripts", "option_types"};
+    Val *arrays[] = {&labels, &tips, &scripts, &types};
+    for (int i = 0; i < 4; i++)
+    {
+        Val wrap = FN(self, array_create, num(1));
+        FN(self, array_set, wrap, num(0), *arrays[i]);
+        drop(arrays[i]);
+        iset(self, subId, names[i], wrap);
+        drop(&wrap);
+    }
+    Val cursor = iget(self, subId, "option_cursor");
+    if (value(cursor) >= itemCount)
+        iset(self, subId, "option_cursor", num(itemCount - 1));
+    drop(&cursor);
+}
+static void open_sub(void *self)
+{
+    if (exists(self, subId) || !exists(self, mainMenuId))
+        return;
+    subId = value(FN(self, instance_create_depth, num(0), num(0), num(mainMenuDepth - 1), num(OBJ_oMenu)));
+    subKey[0] = 0;
+    refresh_sub(self, 1);
+    iset(self, subId, "option_cursor", num(0));
+    iset(self, mainMenuId, "active", num(0));
+    iset(self, mainMenuId, "controls_active", num(0));
+}
+static void close_sub(void *self)
+{
+    if (exists(self, subId))
+        FN(self, instance_destroy, num(subId));
+    subId = -1;
+    if (exists(self, mainMenuId))
+    {
+        iset(self, mainMenuId, "active", num(1));
+        restoreControls = 1; /* after Esc is released, or the pause menu would read it too */
+    }
+}
+static void sub_action(void *self, int cursor)
+{
+    build_items();
+    if (cursor < 0 || cursor >= itemCount)
+        return;
+    switch (items[cursor])
+    {
+    case ITEM_HOST:
+        start_link(HOST);
+        break;
+    case ITEM_JOIN:
+        coop_join();
+        break;
+    case ITEM_COPY:
+        clipboard_copy(bus->invite);
+        if (bus->invite[0])
+            snprintf(bus->status_text, 192, "%s", T("Приглашение скопировано", "Invite copied"));
+        break;
+    case ITEM_LEAVE:
+        bus->disconnect = 1;
+        break;
+    default:
+        close_sub(self);
+    }
+}
+static void coop_menu_step(void *self)
+{
+    if (pendingFrom >= 0)
+    {
+        double from = pendingFrom;
+        pendingFrom = -1;
+        if (from == mainMenuId)
+            open_sub(self);
+        else if (from == subId)
+            sub_action(self, pendingCursor);
+    }
+    if (subId >= 0)
+    {
+        if (!exists(self, subId) || !exists(self, mainMenuId))
+            close_sub(self);
+        else if (read_field(self, V_ui_b) || read_field(self, V_toggle_pause))
+            close_sub(self);
+        else
+            refresh_sub(self, 0);
+    }
+    if (restoreControls && !read_field(self, V_ui_b) && !read_field(self, V_toggle_pause))
+    {
+        restoreControls = 0;
+        if (exists(self, mainMenuId))
+            iset(self, mainMenuId, "controls_active", num(1));
+    }
+}
+
+/* Status lines appear the way the game prints its own HUD text, then fade out. */
+static char toastText[192];
+static DWORD toastAt;
+static void coop_toast(void *self)
+{
+    if (strcmp(toastText, bus->status_text))
+    {
+        snprintf(toastText, sizeof(toastText), "%s", bus->status_text);
+        toastAt = GetTickCount();
+    }
+    DWORD age = GetTickCount() - toastAt;
+    if (!toastText[0] || age > 6000)
+        return;
+    static int font = -1;
+    if (font < 0)
+    {
+        GameString family;
+        /* The game's own pixel font, with the Cyrillic range the stock menu glyphs use. */
+        font = (int)value(FN(self, font_add, str(&family, "CutePixel.ttf"), num(12), num(0), num(0), num(32), num(1105)));
+    }
+    double w = value(FN0(self, display_get_gui_width)), h = value(FN0(self, display_get_gui_height));
+    Val oldFont = FN0(self, draw_get_font), colour = FN0(self, draw_get_color), alpha = FN0(self, draw_get_alpha);
+    Val ha = FN0(self, draw_get_halign), va = FN0(self, draw_get_valign);
+    FN(self, draw_set_font, num(font));
+    FN(self, draw_set_halign, num(1));
+    FN(self, draw_set_valign, num(2));
+    FN(self, draw_set_alpha, num(age < 5000 ? 1 : (6000 - age) / 1000.0));
+    GameString t;
+    Val text = str(&t, toastText);
+    FN(self, draw_set_color, num(0x1a1a24));
+    FN(self, draw_text, num(w * .5 + 1), num(h - 9), text);
+    FN(self, draw_set_color, num(0xffffff));
+    FN(self, draw_text, num(w * .5), num(h - 10), text);
+    FN(self, draw_set_font, oldFont);
+    FN(self, draw_set_color, colour);
+    FN(self, draw_set_alpha, alpha);
+    FN(self, draw_set_halign, ha);
+    FN(self, draw_set_valign, va);
+}
+static int install_menu_hook(void)
+{
+    unsigned char *code = addr(S_open_steam_page);
+    static const unsigned char prologue[] = {0x55, 0x89, 0xe5, 0x53, 0x57};
+    if (memcmp(code, prologue, sizeof(prologue)))
+        return 0;
+    DWORD old;
+    if (!VirtualProtect(code, 5, PAGE_EXECUTE_READWRITE, &old))
+        return 0;
+    code[0] = 0xe9;
+    *(int32_t *)(code + 1) = (int32_t)((uintptr_t)coop_script - (uintptr_t)(code + 5));
+    VirtualProtect(code, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, 5);
+    return 1;
+}
+static void coop_script_id(void *self)
+{
+    if (coopScript >= 0)
+        return;
+    GameString t;
+    double id = value(FN(self, asset_get_index, str(&t, "open_steam_page")));
+    if (id >= 0)
+        coopScript = (int)id;
+}
