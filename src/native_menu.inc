@@ -469,7 +469,7 @@ static int soft_pause_wanted(void)
 }
 #define S_unpause 0x561750
 #define OBJ_oBugopedia_name "oBugopedia"
-static int softPaused, softTicks;
+static int softTicks;
 static double softCaller;
 static void soft_lock(double on)
 {
@@ -535,28 +535,43 @@ static void soft_pause_step(void *self, int subWasOpen)
         *field(self, V_ui_b) = num(0);
     }
 }
-static int install_enpause_hook(void)
+/* Replaces the first 5 bytes of a compiled GML script (push ebp; mov ebp,esp; push ebx; push edi)
+   with a jump to `hook`; *original gets a trampoline that runs those bytes and jumps back. */
+/* Jumps from `va` to `hook`. If `original` is given, it gets a trampoline that runs the 5 bytes
+   overwritten (they must be whole instructions with no relative operands) and jumps back. */
+static int hook_code(uintptr_t va, const unsigned char *prologue, void *hook, void **original)
 {
-    unsigned char *code = addr(S_enpause);
-    static const unsigned char prologue[] = {0x55, 0x89, 0xe5, 0x53, 0x57};
-    if (memcmp(code, prologue, sizeof(prologue)))
+    unsigned char *code = addr(va);
+    if (memcmp(code, prologue, 5))
         return 0;
-    unsigned char *tramp = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if (!tramp)
-        return 0;
-    memcpy(tramp, prologue, 5);
-    tramp[5] = 0xe9;
-    *(int32_t *)(tramp + 6) = (int32_t)((uintptr_t)(code + 5) - (uintptr_t)(tramp + 10));
-    FlushInstructionCache(GetCurrentProcess(), tramp, 16);
-    enpauseOriginal = (Script)tramp;
+    if (original)
+    {
+        unsigned char *tramp = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!tramp)
+            return 0;
+        memcpy(tramp, prologue, 5);
+        tramp[5] = 0xe9;
+        *(int32_t *)(tramp + 6) = (int32_t)((uintptr_t)(code + 5) - (uintptr_t)(tramp + 10));
+        FlushInstructionCache(GetCurrentProcess(), tramp, 16);
+        *original = tramp;
+    }
     DWORD old;
     if (!VirtualProtect(code, 5, PAGE_EXECUTE_READWRITE, &old))
         return 0;
     code[0] = 0xe9;
-    *(int32_t *)(code + 1) = (int32_t)((uintptr_t)coop_enpause - (uintptr_t)(code + 5));
+    *(int32_t *)(code + 1) = (int32_t)((uintptr_t)hook - (uintptr_t)(code + 5));
     VirtualProtect(code, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), code, 5);
     return 1;
+}
+static int hook_script(uintptr_t va, void *hook, Script *original)
+{
+    static const unsigned char gmlPrologue[] = {0x55, 0x89, 0xe5, 0x53, 0x57};
+    return hook_code(va, gmlPrologue, hook, (void **)original);
+}
+static int install_enpause_hook(void)
+{
+    return hook_script(S_enpause, coop_enpause, &enpauseOriginal);
 }
 static int install_menu_hook(void)
 {

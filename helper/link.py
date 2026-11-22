@@ -982,27 +982,41 @@ async def link(pid, profile=None):
                     host_ip, port = "127.0.0.1", int(direct)
                 else:
                     exe = need_porthole()
-                    game.status(2, "Подключение через Steam...")
-                    tunnel = Porthole(
-                        exe,
-                        [
-                            "connect",
-                            code,
-                            "--password",
-                            lobby_password(secret),
-                            "--auto-approve-ports",
-                            f"tcp/{PORT}",
-                            "--remap",
-                            f"{PORT}:0",
-                        ],
-                    )
-                    await tunnel.start()
-                    try:
-                        ready = await tunnel.wait("port_ready", 60, port=PORT)
-                    except TimeoutError:
-                        raise ConnectionError(
-                            "Хост не ответил через Steam · проверьте приглашение"
-                        ) from None
+                    # A world opened a moment ago may not be visible on Steam yet: retry a few times.
+                    for attempt in range(1, 4):
+                        game.status(
+                            2,
+                            "Подключение через Steam..."
+                            if attempt == 1
+                            else f"Повторяю подключение ({attempt}/3)...",
+                        )
+                        tunnel = Porthole(
+                            exe,
+                            [
+                                "connect",
+                                code,
+                                "--password",
+                                lobby_password(secret),
+                                "--auto-approve-ports",
+                                f"tcp/{PORT}",
+                                "--remap",
+                                f"{PORT}:0",
+                            ],
+                        )
+                        await tunnel.start()
+                        try:
+                            ready = await tunnel.wait("port_ready", 60, port=PORT)
+                            break
+                        except TimeoutError:
+                            raise ConnectionError(
+                                "Хост не ответил через Steam · проверьте приглашение"
+                            ) from None
+                        except ConnectionError as exc:
+                            await tunnel.close()
+                            tunnel = None
+                            if attempt == 3 or str(exc) != DENIED["unreachable"]:
+                                raise
+                            await asyncio.sleep(4)
                     host_ip, port = str(ready["local"]).rsplit(":", 1)
                     host_ip = str(ipaddress.ip_address(host_ip.strip("[]")))
                     port = int(port)

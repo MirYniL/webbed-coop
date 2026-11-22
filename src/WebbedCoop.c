@@ -36,7 +36,7 @@ static Bus *bus;
 static void *player, *remote, *io, *cam;
 static DWORD remotePress, remoteRelease;
 static Spider incoming, lastRemote;
-static int adding, lobby, guestSlot, menuTick, guestSlotPending, localPaused;
+static int adding, lobby, guestSlot, menuTick, guestSlotPending, localPaused, softPaused;
 /* Spider.active: 0 none, 1 playing, 2 that player has the game paused (their world is frozen). */
 enum
 {
@@ -199,9 +199,15 @@ static double dir(double x, double y)
     double d = atan2(-y, x) * 57.2957795131;
     return d < 0 ? d + 360 : d;
 }
+#define V_grabbable 0x188f6
+#define V_attached_webs 0x186ea
 static void on_create(void *self, void *other)
 {
     createPlayer(self, other);
+    /* Webs and the grapple may now hit a spider; the web code reads these on whatever it hits. */
+    *field(self, V_grabbable) = num(1);
+    *field(self, V_breakable) = num(0);
+    *field(self, V_attached_webs) = num(0);
     if (adding)
     {
         remote = self;
@@ -252,6 +258,8 @@ static void remote_event(Event orig, void *self, void *other)
                        V_bugopedia,
                        V_bugopedia_pressed,
                        V_show_cursor};
+    /* show_cursor 0: the friend's aim crosshair would otherwise sit on screen all the time; the
+       stock grapple marker still shows while they hold the grapple, as in the original game. */
     double vars[] = {dx,
                      dy,
                      fmin(1, hypot(dx, dy)),
@@ -275,7 +283,7 @@ static void remote_event(Event orig, void *self, void *other)
                      0,
                      0,
                      0,
-                     1};
+                     0};
     _Static_assert(sizeof(ids) / sizeof(*ids) == sizeof(vars) / sizeof(*vars), "pad fields");
     Val old[sizeof(ids) / sizeof(*ids)];
     for (unsigned i = 0; i < sizeof(ids) / sizeof(*ids); i++)
@@ -472,26 +480,24 @@ static void network_frame(void *self)
 #include "native_menu.inc"
 
 #include "markers.inc"
+
+#include "interact.inc"
 /* Webbed pauses itself when its window loses focus (os_is_paused in oIO). During a session that
    would freeze one player whenever they look at a chat, and on one PC it pauses the second
    window outright; Esc still pauses. The call goes through a function slot we can wrap. */
-#define SLOT_os_is_paused 0x15cadc8
 #define F_os_is_paused_impl 0x12d0560
-static Builtin osIsPaused;
+#define APP_PAUSED_FLAG 0x189a19d
+/* Replaces the builtin outright: it only reads the runner's "window lost focus" flag. */
 static void coop_os_is_paused(Val *ret, void *self, void *other, int argc, Val *args)
 {
-    osIsPaused(ret, self, other, argc, args);
-    if (bus && bus->role)
-        *ret = num(0);
+    (void)self, (void)other, (void)argc, (void)args;
+    *ret = num(!(bus && bus->role) && *(unsigned char *)addr(APP_PAUSED_FLAG));
 }
-static void wrap_focus_pause(void)
+static int hook_code(uintptr_t va, const unsigned char *prologue, void *hook, void **original);
+static int install_focus_hook(void)
 {
-    Builtin *slot = addr(SLOT_os_is_paused);
-    if (!osIsPaused && *slot == (Builtin)addr(F_os_is_paused_impl))
-    {
-        osIsPaused = *slot;
-        *slot = coop_os_is_paused;
-    }
+    static const unsigned char body[] = {0x8b, 0x44, 0x24, 0x04, 0xc7};
+    return hook_code(F_os_is_paused_impl, body, coop_os_is_paused, NULL);
 }
 /* A window without focus gets no input in a session: on one PC a gamepad would otherwise drive
    both spiders. */
@@ -505,11 +511,21 @@ static void drop_unfocused_input(void *self)
     for (unsigned i = 0; i < sizeof(ids) / sizeof(*ids); i++)
         *field(self, ids[i]) = num(0);
 }
+static void interaction_step(void *self);
+static void draw_hearts(void *self);
 static void on_input(void *self, void *other)
 {
     io = self;
-    wrap_focus_pause();
+    /* In a soft-paused menu the input object must behave as in a real pause (mouse released,
+       no aiming at the cursor); only it sees the flag, the camera keeps the live view. */
+    if (softPaused)
+        global_set(self, "paused", num(1));
     stepInput(self, other);
+    if (softPaused)
+    {
+        global_set(self, "paused", num(0));
+        *field(self, V_show_cursor) = num(0); /* no aim crosshair under the menu */
+    }
     drop_unfocused_input(self);
     menuTick++;
     coop_script_id(self);
@@ -517,6 +533,7 @@ static void on_input(void *self, void *other)
     coop_menu_step(self);
     network_frame(self);
     sync_world(self);
+    interaction_step(self);
     campaign_commands(self);
 #ifdef NET_QA
     qa_step(self);
@@ -527,6 +544,7 @@ static void on_gui(void *self, void *other)
 {
     drawGui(self, other);
     edge_marker(self);
+    draw_hearts(self);
     coop_toast(self);
     clear_texts();
 }
@@ -570,6 +588,10 @@ __declspec(dllexport) double webbed_coop_init(void)
     }
     if (!install_enpause_hook())
         log_line("coop: soft pause unavailable, the game pauses as usual");
+    if (!install_focus_hook())
+        log_line("coop: focus pause hook unavailable");
+    if (!install_interaction_hooks())
+        log_line("coop: spider interaction unavailable");
     open_world_map();
     bus->magic = 0x57425032;
     GetModuleFileNameW(NULL, runtimeDir, MAX_PATH);
