@@ -141,6 +141,36 @@ typedef struct
 } Binding;
 static Binding nodeBindings[WEB_MAX * 2], webBindings[WEB_MAX];
 static int nodeCount, webCount;
+/* Small open-addressing table: instance id -> index, rebuilt per update (ids are > 100000). */
+#define TABLE_SIZE 4096
+typedef struct
+{
+    int key[TABLE_SIZE], val[TABLE_SIZE];
+} Table;
+static void table_clear(Table *t)
+{
+    memset(t->key, 0, sizeof(t->key));
+}
+static void table_put(Table *t, int key, int val)
+{
+    unsigned h = (unsigned)key * 2654435761u % TABLE_SIZE;
+    for (unsigned i = 0; i < TABLE_SIZE; i++, h = (h + 1) % TABLE_SIZE)
+        if (!t->key[h] || t->key[h] == key)
+        {
+            t->key[h] = key;
+            t->val[h] = val;
+            return;
+        }
+}
+static int table_get(const Table *t, int key, int missing)
+{
+    unsigned h = (unsigned)key * 2654435761u % TABLE_SIZE;
+    for (unsigned i = 0; i < TABLE_SIZE && t->key[h]; i++, h = (h + 1) % TABLE_SIZE)
+        if (t->key[h] == key)
+            return t->val[h];
+    return missing;
+}
+static Table localById, bindingByHost, incomingIds;
 static void bind_id(Binding *list, int *n, int limit, int host, int local)
 {
     for (int i = 0; i < *n; i++)
@@ -223,6 +253,7 @@ static void apply_world(void *self)
     if (w->room != bus->room || w->numWebs > WEB_MAX || w->numBodies > BODY_MAX)
         return;
     int entering = knownRoom != w->room;
+    (void)entering;
     if (entering)
     {
         nodeCount = webCount = 0;
@@ -237,35 +268,38 @@ static void apply_world(void *self)
         localWebs[n++] = (LocalWeb){
             instance_id(p), 0, read_field(p, V_ox), read_field(p, V_oy), read_field(p, V_ax), read_field(p, V_ay)};
     }
-    Binding fresh[WEB_MAX];
+    static Binding fresh[WEB_MAX];
     int count = 0;
+    table_clear(&localById);
+    table_clear(&bindingByHost);
+    for (int j = 0; j < n; j++)
+        table_put(&localById, localWebs[j].id, j);
+    for (int j = 0; j < webCount; j++)
+        table_put(&bindingByHost, webBindings[j].host, webBindings[j].local);
     for (unsigned i = 0; i < w->numWebs; i++)
     {
         Strand *s = &w->web[i];
-        int match = -1, target = bound(webBindings, webCount, s->id);
-        double minCost = 100;
-        for (int j = 0; j < n; j++)
+        int target = table_get(&bindingByHost, s->id, -4);
+        int match = target >= 100000 ? table_get(&localById, target, -1) : -1;
+        if (match >= 0 && localWebs[match].used)
+            match = -1;
+        if (match < 0)
         {
-            LocalWeb *l = &localWebs[j];
-            if (l->used)
-                continue;
-            if (l->id == target)
+            /* A strand seen for the first time: pair it with a local web at the same place, if any. */
+            double minCost = 100;
+            for (int j = 0; j < n; j++)
             {
-                match = j;
-                break;
+                LocalWeb *l = &localWebs[j];
+                if (l->used)
+                    continue;
+                double cost = fabs(l->ox - s->props[0]) + fabs(l->oy - s->props[1]) + fabs(l->ax - s->props[2]) +
+                              fabs(l->ay - s->props[3]);
+                if (cost < minCost)
+                {
+                    match = j;
+                    minCost = cost;
+                }
             }
-            double cost = fabs(l->ox - s->props[0]) + fabs(l->oy - s->props[1]) + fabs(l->ax - s->props[2]) +
-                          fabs(l->ay - s->props[3]);
-            if (cost < minCost)
-            {
-                match = j;
-                minCost = cost;
-            }
-        }
-        if (match < 0 && (entering || target == -1))
-        {
-            fresh[count++] = (Binding){s->id, -1};
-            continue;
         }
         if (match >= 0)
         {
@@ -304,19 +338,18 @@ static void apply_world(void *self)
         fresh[count++] = (Binding){s->id, (int)value(id)};
     }
     if (w->complete)
+    {
+        table_clear(&incomingIds);
+        for (unsigned j = 0; j < w->numWebs; j++)
+            table_put(&incomingIds, w->web[j].id, 1);
+    }
+    if (w->complete)
         for (int i = 0; i < webCount; i++)
         {
             Binding old = webBindings[i];
             if (old.local < 100000)
                 continue;
-            int present = 0;
-            for (unsigned j = 0; j < w->numWebs; j++)
-                if (w->web[j].id == old.host)
-                {
-                    present = 1;
-                    break;
-                }
-            if (!present)
+            if (!table_get(&incomingIds, old.host, 0))
             {
                 p = find_id(self, old.local);
                 if (p && object_type(p) == 107)
@@ -352,7 +385,11 @@ static void sync_world(void *self)
         knownRoom = ~0u;
         return;
     }
-    if (bus->role == HOST && menuTick % 8 == 0)
+    /* Pausing deactivates every instance: a world read now would have no webs, and one applied now
+       would duplicate webs that are only switched off. Wait for both games to be running. */
+    if (localPaused || incoming.active == SPIDER_PAUSED)
+        return;
+    if (bus->role == HOST && menuTick % 4 == 0)
         publish_world(self);
     if (bus->role == GUEST)
         apply_world(self);

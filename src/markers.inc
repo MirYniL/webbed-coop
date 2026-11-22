@@ -1,5 +1,6 @@
 /* Friend markers drawn with Webbed's own sprites: the journal's map pin and the UI arrow. */
 #include "marker_ids.h"
+static void shadow_text(void *, double, double, const char *, int, double);
 
 typedef struct { double x, y; int valid; } MapPoint;
 static Event drawBook;
@@ -72,27 +73,40 @@ static void on_book_draw(void *self,void *other){
     FN(self,draw_set_alpha,alpha);
 }
 
+/* Where the friend was last seen in this room: when they leave through a door, that door is
+   where to follow them (journal map positions of caves and side rooms say little about the way). */
+static double lastSeenX, lastSeenY;
+static unsigned lastSeenRoom=~0u;
 static void edge_marker(void *self){
     if(!peer_live() || mapVisible || exists(self,subId))return;
-    double w=value(FN0(self,display_get_gui_width)),h=value(FN0(self,display_get_gui_height));
-    double dx=0,dy=0;
+    double tx,ty;
+    int away=0;
     if(incoming.room==bus->room){
-        Val camera=FN(self,view_get_camera,num(0));
-        double cw=value(FN(self,camera_get_view_width,camera)),ch=value(FN(self,camera_get_view_height,camera));
-        if(cw<=0 || ch<=0)return;
-        dx=(incoming.x-value(FN(self,camera_get_view_x,camera)))/cw*w-w*.5;
-        dy=(incoming.y-value(FN(self,camera_get_view_y,camera)))/ch*h-h*.5;
-        if(fabs(dx)<=w*.5 && fabs(dy)<=h*.5)return;
-    }else{
-        if(lastMapOwn!=bus->room || lastMapPeer!=incoming.room || !ownRoom.valid || !peerRoom.valid)return;
-        dx=peerRoom.x-ownRoom.x;dy=peerRoom.y-ownRoom.y;
-    }
-    double len=hypot(dx,dy),margin=18;
-    if(len<.01 || w<=2*margin || h<=2*margin)return;
-    double k=1/fmax(fabs(dx)/(w*.5-margin),fabs(dy)/(h*.5-margin));
-    double x=w*.5+k*dx,y=h*.5+k*dy;
-    double pulse=1+.08*sin(GetTickCount()/170.0);
+        tx=incoming.x;ty=incoming.y;
+        lastSeenX=tx;lastSeenY=ty;lastSeenRoom=bus->room;
+    }else if(lastSeenRoom==bus->room){
+        tx=lastSeenX;ty=lastSeenY;away=1;
+    }else return;
+    double w=value(FN0(self,display_get_gui_width)),h=value(FN0(self,display_get_gui_height));
+    Val camera=FN(self,view_get_camera,num(0));
+    double cw=value(FN(self,camera_get_view_width,camera)),ch=value(FN(self,camera_get_view_height,camera));
+    if(cw<=0 || ch<=0)return;
+    double gx=(tx-value(FN(self,camera_get_view_x,camera)))/cw*w,gy=(ty-value(FN(self,camera_get_view_y,camera)))/ch*h;
+    double dx=gx-w*.5,dy=gy-h*.5;
     Val alpha=FN0(self,draw_get_alpha);FN(self,draw_set_alpha,num(1));
-    arrow(self,x,y,dx/len,dy/len,30*pulse,peer_colour());
+    double pulse=1+.08*sin(GetTickCount()/170.0);
+    if(fabs(dx)<=w*.5-8 && fabs(dy)<=h*.5-8){
+        /* On screen: the friend is visible themselves; if they left, mark the way they went. */
+        if(away){
+            arrow(self,gx,gy-14-3*sin(GetTickCount()/170.0),0,1,22,peer_colour());
+            shadow_text(self,gx,gy-44,russian(io)?"Друг ушёл сюда":"Your friend went this way",0xffffff,1);
+        }
+    }else{
+        double len=hypot(dx,dy),margin=18;
+        if(len>.01 && w>2*margin && h>2*margin){
+            double k=1/fmax(fabs(dx)/(w*.5-margin),fabs(dy)/(h*.5-margin));
+            arrow(self,w*.5+k*dx,h*.5+k*dy,dx/len,dy/len,30*pulse,peer_colour());
+        }
+    }
     FN(self,draw_set_alpha,alpha);
 }

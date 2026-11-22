@@ -71,6 +71,73 @@ static void apply_pickup(void *self, Val rooms, const char *roomName, char *payl
     }
 }
 
+/* Merged into the live game state, never replacing it: whatever this player did since the last
+   checkpoint stays (so a peer's patch needs no fresh save first, which would be a visible hitch). */
+static void merge_array(void *self, const char *key, Val list)
+{
+    Val incoming = script(self, S_list_to_array, 1, &list);
+    Val current = global_get(self, key);
+    if (value(FN(self, is_array, current)))
+    {
+        int n = (int)value(FN(self, array_length, incoming)), m = (int)value(FN(self, array_length, current));
+        for (int i = 0; i < n && i < m; i++)
+        {
+            double a = value(FN(self, array_get, incoming, num(i))), b = value(FN(self, array_get, current, num(i)));
+            if (a > b)
+                FN(self, array_set, current, num(i), num(a));
+        }
+        global_set(self, key, current);
+    }
+    else
+        global_set(self, key, incoming);
+    drop(&current);
+    drop(&incoming);
+}
+static int same_text(Val a, Val b)
+{
+    return (a.kind & 0xffffff) == 1 && (b.kind & 0xffffff) == 1 && a.str && b.str && a.str->text && b.str->text &&
+           !strcmp(a.str->text, b.str->text);
+}
+static void merge_tasks(void *self, Val list)
+{
+    Val tasks = global_get(self, "tasks");
+    if (!isnum(tasks))
+        return;
+    GameString k;
+    int n = (int)value(FN(self, ds_list_size, list));
+    for (int i = 0; i < n; i++)
+    {
+        Val task = FN(self, ds_list_find_value, list, num(i));
+        Val id = FN(self, ds_map_find_value, task, str(&k, "id"));
+        int m = (int)value(FN(self, ds_list_size, tasks)), found = 0;
+        for (int j = 0; j < m && !found; j++)
+        {
+            Val mine = FN(self, ds_list_find_value, tasks, num(j));
+            Val myId = FN(self, ds_map_find_value, mine, str(&k, "id"));
+            if (same_text(id, myId))
+            {
+                found = 1;
+                const char *fields[] = {"completed", "counter", "counter_total"};
+                for (int f = 0; f < 3; f++)
+                {
+                    Val theirs = FN(self, ds_map_find_value, task, str(&k, fields[f]));
+                    Val ours = FN(self, ds_map_find_value, mine, str(&k, fields[f]));
+                    if (isnum(theirs) && (!isnum(ours) || value(theirs) > value(ours)))
+                        FN(self, ds_map_set, mine, str(&k, fields[f]), num(value(theirs)));
+                }
+            }
+            drop(&myId);
+        }
+        if (!found)
+        {
+            Val copy = FN0(self, ds_map_create);
+            FN(self, ds_map_copy, copy, task);
+            FN(self, ds_list_add, tasks, copy);
+            FN(self, ds_list_mark_as_map, tasks, num(m));
+        }
+        drop(&id);
+    }
+}
 static void apply_patch(void *self)
 {
     FILE *f = _wfopen(patchFile, L"rb");
@@ -134,20 +201,9 @@ static void apply_patch(void *self)
             {
                 Val list = FN(self, ds_map_find_value, root, str(&c, "v"));
                 if (isnum(list) && line[0] == 'A')
-                {
-                    Val arr = script(self, S_list_to_array, 1, &list);
-                    global_set(self, key, arr);
-                    drop(&arr);
-                }
+                    merge_array(self, key, list);
                 else if (isnum(list))
-                {
-                    /* Match Webbed's task restore: the save map owns the deserialized list. */
-                    Val tasks = global_get(self, "tasks");
-                    FN(self, ds_list_copy, tasks, list);
-                    GameString owner;
-                    FN(self, ds_map_replace_map, save, str(&owner, "WebbedCoopTaskOwner"), root);
-                    root = undef();
-                }
+                    merge_tasks(self, list);
                 if (isnum(root))
                     FN(self, ds_map_destroy, root);
             }

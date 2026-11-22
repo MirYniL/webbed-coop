@@ -15,6 +15,7 @@
 #define F_array_get 0x117f090
 #define F_array_length 0x117f2b0
 #define F_asset_get_index 0x1304840
+#define F_instance_find 0x11ab580
 #define F_draw_sprite_ext 0x11d4a00
 #define F_gpu_set_fog 0x12e9130
 #define F_is_array 0x1180ab0
@@ -359,8 +360,10 @@ static void sub_action(void *self, int cursor)
         close_sub(self);
     }
 }
+static void soft_pause_step(void *self, int subWasOpen);
 static void coop_menu_step(void *self)
 {
+    int subWasOpen = subId >= 0;
     /* The moment Porthole hands out the invite, it goes to the clipboard by itself. */
     if (invite_ready() && strcmp(copiedFor, bus->invite))
     {
@@ -393,6 +396,7 @@ static void coop_menu_step(void *self)
         if (exists(self, mainMenuId))
             iset(self, mainMenuId, "controls_active", num(1));
     }
+    soft_pause_step(self, subWasOpen);
 }
 
 /* Text the way the game prints its own HUD lines: pixel font, white with a dark shadow. */
@@ -452,6 +456,107 @@ static void coop_toast(void *self)
     if (!pending && age > 6000)
         return;
     shadow_text(self, w * .5, h - 22, toastText, 0xffffff, pending || age < 5000 ? 1 : (6000 - age) / 1000.0);
+}
+/* Pause in a session is "soft": the menu and the journal open, this player's spider stops taking
+   input (io.locked), but the world keeps running for the friend, like an online game. Outside a
+   session the original enpause runs through a trampoline. */
+#define S_enpause 0x560600
+#define V_locked_io 0x189c6
+static Script enpauseOriginal;
+static int soft_pause_wanted(void)
+{
+    return bus && bus->role && !guestSlotPending;
+}
+#define S_unpause 0x561750
+#define OBJ_oBugopedia_name "oBugopedia"
+static int softPaused, softTicks;
+static double softCaller;
+static void soft_lock(double on)
+{
+    if (player)
+        *field(player, V_locked_io) = num(on);
+    if (io)
+        *field(io, V_locked_io) = num(on);
+    if (softCaller >= 0 && exists(io, softCaller))
+        iset(io, softCaller, "locked", num(on));
+}
+static Val *coop_enpause(void *self, void *other, Val *ret, int argc, Val **argv)
+{
+    if (!soft_pause_wanted())
+        return enpauseOriginal(self, other, ret, argc, argv);
+    /* No "paused" flag: with it the camera swaps the live view for a frozen screenshot. The menu
+       (or the journal) is opened by the caller all the same; the spider just stops taking input. */
+    softCaller = coord(self, B_id);
+    softPaused = 1;
+    softTicks = 0;
+    soft_lock(1);
+    log_line("coop: soft pause");
+    return ret;
+}
+static void soft_unpause(void *self, const char *why)
+{
+    Val r = script(self, S_unpause, 0, NULL);
+    drop(&r);
+    soft_lock(0);
+    softPaused = 0;
+    log_line(why);
+}
+/* Esc in a soft-paused menu: the game's own handler waits for the "paused" flag, so close it here
+   with the game's unpause, and swallow the key so the same press does not open the menu again.
+   A menu closed by its own Resume button, or a closed journal, just unlocks the spider. */
+static void soft_pause_step(void *self, int subWasOpen)
+{
+    if (!softPaused)
+        return;
+    softTicks++;
+    int menuOpen = exists(self, mainMenuId);
+    Val bookOpen = undef();
+    GameString t;
+    Val book = FN(self, asset_get_index, str(&t, OBJ_oBugopedia_name));
+    int journal = 0;
+    if (isnum(book) && value(FN(self, instance_exists, book)))
+    {
+        bookOpen = iget(self, value(FN(self, instance_find, book, num(0))), "open");
+        journal = isnum(bookOpen) && value(bookOpen) != 0;
+    }
+    if (softTicks > 10 && !menuOpen && !journal)
+    {
+        soft_lock(0);
+        softPaused = 0;
+        log_line("coop: soft pause ended");
+        return;
+    }
+    if (subWasOpen || exists(self, subId) || restoreControls || !menuOpen)
+        return;
+    if (read_field(self, V_toggle_pause) && value(iget(self, mainMenuId, "controls_active")))
+    {
+        soft_unpause(self, "coop: soft pause closed");
+        *field(self, V_toggle_pause) = num(0);
+        *field(self, V_ui_b) = num(0);
+    }
+}
+static int install_enpause_hook(void)
+{
+    unsigned char *code = addr(S_enpause);
+    static const unsigned char prologue[] = {0x55, 0x89, 0xe5, 0x53, 0x57};
+    if (memcmp(code, prologue, sizeof(prologue)))
+        return 0;
+    unsigned char *tramp = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!tramp)
+        return 0;
+    memcpy(tramp, prologue, 5);
+    tramp[5] = 0xe9;
+    *(int32_t *)(tramp + 6) = (int32_t)((uintptr_t)(code + 5) - (uintptr_t)(tramp + 10));
+    FlushInstructionCache(GetCurrentProcess(), tramp, 16);
+    enpauseOriginal = (Script)tramp;
+    DWORD old;
+    if (!VirtualProtect(code, 5, PAGE_EXECUTE_READWRITE, &old))
+        return 0;
+    code[0] = 0xe9;
+    *(int32_t *)(code + 1) = (int32_t)((uintptr_t)coop_enpause - (uintptr_t)(code + 5));
+    VirtualProtect(code, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), code, 5);
+    return 1;
 }
 static int install_menu_hook(void)
 {

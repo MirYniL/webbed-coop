@@ -1,4 +1,10 @@
 #include "build.h"
+#define F_instance_exists 0x11ab540
+#define F_ds_map_create 0x11b3910
+#define F_array_length 0x117f2b0
+#define F_array_get 0x117f090
+#define F_array_create 0x117eb40
+#define F_is_array 0x1180ab0
 #include "session.h"
 #include <math.h>
 #include <stdint.h>
@@ -30,11 +36,18 @@ static Bus *bus;
 static void *player, *remote, *io, *cam;
 static DWORD remotePress, remoteRelease;
 static Spider incoming, lastRemote;
-static int adding, lobby, guestSlot, menuTick, guestSlotPending;
+static int adding, lobby, guestSlot, menuTick, guestSlotPending, localPaused;
+/* Spider.active: 0 none, 1 playing, 2 that player has the game paused (their world is frozen). */
+enum
+{
+    SPIDER_NONE,
+    SPIDER_PLAYING,
+    SPIDER_PAUSED
+};
 static uint32_t appliedSequence;
 static HANDLE helper, sessionMap;
 static Val originalSlot;
-static Event createPlayer, stepPlayer, drawPlayer, endPlayer, cleanPlayer, stepInput, stepCamera, drawGui;
+static Event createPlayer, stepPlayer, drawPlayer, drawEndPlayer, endPlayer, cleanPlayer, stepInput, stepCamera, drawGui;
 static wchar_t runtimeDir[MAX_PATH], patchFile[MAX_PATH];
 static const unsigned objectRemote = 467;
 static void *addr(uintptr_t va)
@@ -293,23 +306,54 @@ static void on_step(void *self, void *other)
         FN0(self, instance_destroy);
         return;
     }
+    if (incoming.active == SPIDER_PAUSED)
+    {
+        /* The friend paused: their spider stands still exactly where they left it. */
+        set_coord(self, B_phy_position_x, incoming.x);
+        set_coord(self, B_phy_position_y, incoming.y);
+        set_coord(self, B_phy_speed_x, 0);
+        set_coord(self, B_phy_speed_y, 0);
+        appliedSequence = incoming.sequence;
+        return;
+    }
     if (io)
         remote_event(stepPlayer, self, other);
+    /* The friend's spider runs on their buttons here; each network frame says where it really is.
+       Small differences are eased in over a few frames instead of teleporting the spider, which
+       read as stutter; only a big jump (a door, a respawn) snaps. */
+    static double corrX, corrY;
     if (incoming.sequence != appliedSequence)
     {
         appliedSequence = incoming.sequence;
         double dx = incoming.x - coord(self, B_x), dy = incoming.y - coord(self, B_y);
-        if (fabs(dx) > 3 || fabs(dy) > 3)
+        if (fabs(dx) + fabs(dy) > 64)
         {
-            double t = (fabs(dx) + fabs(dy) > 40) ? 1 : .65;
-            set_coord(self, B_phy_position_x, coord(self, B_x) + t * dx);
-            set_coord(self, B_phy_position_y, coord(self, B_y) + t * dy);
+            set_coord(self, B_phy_position_x, incoming.x);
+            set_coord(self, B_phy_position_y, incoming.y);
             set_coord(self, B_phy_speed_x, incoming.vx);
             set_coord(self, B_phy_speed_y, incoming.vy);
+            corrX = corrY = 0;
         }
+        else
+        {
+            corrX = dx;
+            corrY = dy;
+            set_coord(self, B_phy_speed_x, .5 * coord(self, B_phy_speed_x) + .5 * incoming.vx);
+            set_coord(self, B_phy_speed_y, .5 * coord(self, B_phy_speed_y) + .5 * incoming.vy);
+        }
+    }
+    if (fabs(corrX) + fabs(corrY) > .05)
+    {
+        double kx = corrX * .3, ky = corrY * .3;
+        set_coord(self, B_phy_position_x, coord(self, B_x) + kx);
+        set_coord(self, B_phy_position_y, coord(self, B_y) + ky);
+        corrX -= kx;
+        corrY -= ky;
     }
 }
 static void arrow(void *,double,double,double,double,double,int);
+static void shadow_text(void *, double, double, const char *, int, double);
+static int russian(void *);
 static int peer_colour(void);
 static int soft_colour(int,double);
 static void on_draw(void *self, void *other)
@@ -329,7 +373,18 @@ static void on_draw(void *self, void *other)
     Val alpha=FN0(self,draw_get_alpha);
     FN(self,draw_set_alpha,num(1));
     arrow(self,x,y-6,0,1,16,peer_colour());
+    if (incoming.active == SPIDER_PAUSED)
+        shadow_text(self, x, y - 30, russian(io) ? "Пауза" : "Paused", 0xffffff, 1);
     FN(self,draw_set_alpha,alpha);
+}
+/* Draw End paints the grapple/weave aim line towards (gx, gy): for the friend's spider it must
+   read the friend's buttons, not this player's. */
+static void on_draw_end(void *self, void *other)
+{
+    if (self == remote && io)
+        remote_event(drawEndPlayer, self, other);
+    else
+        drawEndPlayer(self, other);
 }
 static void on_end(void *self, void *other)
 {
@@ -351,7 +406,10 @@ static void on_camera(void *self, void *other)
 static void network_frame(void *self)
 {
     Spider s = bus->local;
-    s.active = (player != NULL && !guestSlotPending);
+    /* The pause menu deactivates every instance, so an inactive spider means a paused game
+       (the global "paused" flag can stay set after the menu closes). */
+    localPaused = player && !value(FN(self, instance_exists, num(coord(player, B_id))));
+    s.active = (player != NULL && !guestSlotPending) ? (localPaused ? SPIDER_PAUSED : SPIDER_PLAYING) : SPIDER_NONE;
     s.room = bus->room = (unsigned)coord(self, B_room);
     s.heartbeat = GetTickCount();
     bus->playing = s.active;
@@ -414,10 +472,45 @@ static void network_frame(void *self)
 #include "native_menu.inc"
 
 #include "markers.inc"
+/* Webbed pauses itself when its window loses focus (os_is_paused in oIO). During a session that
+   would freeze one player whenever they look at a chat, and on one PC it pauses the second
+   window outright; Esc still pauses. The call goes through a function slot we can wrap. */
+#define SLOT_os_is_paused 0x15cadc8
+#define F_os_is_paused_impl 0x12d0560
+static Builtin osIsPaused;
+static void coop_os_is_paused(Val *ret, void *self, void *other, int argc, Val *args)
+{
+    osIsPaused(ret, self, other, argc, args);
+    if (bus && bus->role)
+        *ret = num(0);
+}
+static void wrap_focus_pause(void)
+{
+    Builtin *slot = addr(SLOT_os_is_paused);
+    if (!osIsPaused && *slot == (Builtin)addr(F_os_is_paused_impl))
+    {
+        osIsPaused = *slot;
+        *slot = coop_os_is_paused;
+    }
+}
+/* A window without focus gets no input in a session: on one PC a gamepad would otherwise drive
+   both spiders. */
+static void drop_unfocused_input(void *self)
+{
+    if (!bus->role || activeWindow())
+        return;
+    const int ids[] = {V_hm,      V_vm,         V_mvmag,          V_jmp,           V_jmp_held, V_grapple,
+                       V_grapple_pressed, V_weave, V_weave_pressed, V_laser, V_dance, V_interact,
+                       V_interact_held, V_toggle_pause};
+    for (unsigned i = 0; i < sizeof(ids) / sizeof(*ids); i++)
+        *field(self, ids[i]) = num(0);
+}
 static void on_input(void *self, void *other)
 {
     io = self;
+    wrap_focus_pause();
     stepInput(self, other);
+    drop_unfocused_input(self);
     menuTick++;
     coop_script_id(self);
     menu_input(self);
@@ -449,7 +542,8 @@ __declspec(dllexport) double webbed_coop_init(void)
         uintptr_t slot, original;
         Event newEvent, *old;
     } binds[] = {{0x15dbd14,0xe20e80,on_main_menu_create,&createMainMenu},{0x15d9ba8,0x9baa10,on_book_draw,&drawBook},{0x15d9e0c, 0xa609e0, on_create, &createPlayer}, {0x15d9e54, 0xa68e10, on_step, &stepPlayer},
-                 {0x15d9e90, 0xb070a0, on_draw, &drawPlayer},     {0x15d9ea8, 0xb141c0, on_clean, &cleanPlayer},
+                 {0x15d9e90, 0xb070a0, on_draw, &drawPlayer},
+                 {0x15d9e9c, 0xb07de0, on_draw_end, &drawEndPlayer},     {0x15d9ea8, 0xb141c0, on_clean, &cleanPlayer},
                  {0x15d98b4, 0x9532e0, on_input, &stepInput},     {0x15d9818, 0x913b20, on_camera, &stepCamera},
                  {0x15d9e60, 0xaf1800, on_end, &endPlayer},       {0x15d986c, 0x94a460, on_gui, &drawGui}};
     for (unsigned i = 0; i < sizeof(binds) / sizeof(*binds); i++)
@@ -474,6 +568,8 @@ __declspec(dllexport) double webbed_coop_init(void)
         bus = NULL;
         return 0;
     }
+    if (!install_enpause_hook())
+        log_line("coop: soft pause unavailable, the game pauses as usual");
     open_world_map();
     bus->magic = 0x57425032;
     GetModuleFileNameW(NULL, runtimeDir, MAX_PATH);

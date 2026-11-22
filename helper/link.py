@@ -186,14 +186,8 @@ class Game:
         if struct.unpack_from("<I", self.worldmem)[0] == seq:
             return seq, data
 
-    def install_world(self, body):
-        decoder = zlib.decompressobj()
-        data = decoder.decompress(body, WORLD_SIZE + 1)
-        if (
-            not decoder.eof
-            or decoder.unused_data
-            or not WORLD_HEADER.size <= len(data) <= WORLD_SIZE
-        ):
+    def install_world(self, data):
+        if not WORLD_HEADER.size <= len(data) <= WORLD_SIZE:
             raise ValueError("Размер физического мира")
         _, room, n, m, full = WORLD_HEADER.unpack_from(data)
         offset = WORLD_HEADER.size + n * STRAND.size
@@ -231,7 +225,7 @@ class Game:
             raise ValueError("Размер кадра")
         v = list(SPIDER.unpack(data))
         if (
-            v[2] > 1
+            v[2] > 2  # 0 none, 1 playing, 2 paused
             or v[3] > 1024
             or v[4] > 63
             or any(not math.isfinite(x) or abs(x) > 1e7 for x in v[5:13])
@@ -242,6 +236,77 @@ class Game:
         v[0:2] = seq | 1, now_ms()
         self.mem[a : a + SPIDER.size] = SPIDER.pack(*v)
         struct.pack_into("<I", self.mem, a, seq)
+
+
+class WorldDelta:
+    """Host side: of each published world, only what changed since the last one goes out."""
+
+    def __init__(self):
+        self.room = None
+        self.strands = {}
+        self.bodies = {}
+
+    def encode(self, raw):
+        _, room, n, m, complete = WORLD_HEADER.unpack_from(raw)
+        offset = WORLD_HEADER.size
+        strands = {
+            STRAND.unpack_from(raw, offset + i * STRAND.size)[0]: raw[offset + i * STRAND.size : offset + (i + 1) * STRAND.size]
+            for i in range(n)
+        }
+        offset += n * STRAND.size
+        bodies = {
+            BODY.unpack_from(raw, offset + i * BODY.size)[0]: raw[offset + i * BODY.size : offset + (i + 1) * BODY.size]
+            for i in range(m)
+        }
+        if room != self.room:
+            self.room, self.strands, self.bodies = room, {}, {}
+        changed = [v for k, v in strands.items() if self.strands.get(k) != v]
+        removed = [k for k in self.strands if k not in strands]
+        moved = [v for k, v in bodies.items() if self.bodies.get(k) != v]
+        gone = [k for k in self.bodies if k not in bodies]
+        self.strands, self.bodies = strands, bodies
+        if not (changed or removed or moved or gone):
+            return None
+        head = struct.pack("<6I", room, complete, len(changed), len(removed), len(moved), len(gone))
+        ids = struct.pack(f"<{len(removed) + len(gone)}i", *removed, *gone)
+        return head + b"".join(changed) + b"".join(moved) + ids
+
+
+class WorldMirror:
+    """Guest side: rebuilds the host's full world from the deltas and hands it to the game."""
+
+    def __init__(self):
+        self.room = None
+        self.strands = {}
+        self.bodies = {}
+
+    def apply(self, body):
+        room, complete, nc, nr, nm, ng = struct.unpack_from("<6I", body)
+        if max(nc, nr) > 1536 or max(nm, ng) > 768 or complete > 1:
+            raise ValueError("Пакет физического мира")
+        need = 24 + nc * STRAND.size + nm * BODY.size + 4 * (nr + ng)
+        if len(body) != need:
+            raise ValueError("Размер физического мира")
+        if room != self.room:
+            self.room, self.strands, self.bodies = room, {}, {}
+        offset = 24
+        for _ in range(nc):
+            rec = body[offset : offset + STRAND.size]
+            self.strands[STRAND.unpack_from(rec)[0]] = rec
+            offset += STRAND.size
+        for _ in range(nm):
+            rec = body[offset : offset + BODY.size]
+            self.bodies[BODY.unpack_from(rec)[0]] = rec
+            offset += BODY.size
+        ids = struct.unpack_from(f"<{nr + ng}i", body, offset)
+        for k in ids[:nr]:
+            self.strands.pop(k, None)
+        for k in ids[nr:]:
+            self.bodies.pop(k, None)
+        if len(self.strands) > 1536 or len(self.bodies) > 768:
+            raise ValueError("Пакет физического мира")
+        head = WORLD_HEADER.pack(0, room, len(self.strands), len(self.bodies), complete)
+        return head + b"".join(self.strands.values()) + b"".join(self.bodies.values())
 
 
 class Wire:
@@ -454,6 +519,8 @@ class Play:
         self.closed = asyncio.Event()
         self.last_room = world["current_room"]
         self.inventory = Inventory(world)
+        self.delta = WorldDelta()
+        self.mirror = WorldMirror()
         self.lock = asyncio.Lock()
         self.dirty = False
 
@@ -463,7 +530,7 @@ class Play:
             if kind == b"P":
                 self.g.remote(body)
             elif kind == b"W" and not self.host:
-                self.g.install_world(body)
+                self.g.install_world(self.mirror.apply(zlib.decompress(body)))
             elif kind == b"Q":
                 if self.g.word(7):
                     await self.checkpoint(self.g.word(8))
@@ -475,10 +542,8 @@ class Play:
             elif kind == b"D":
                 p = safe_patch(unpack_json(body))
                 async with self.lock:
-                    # Fold in what this player did since the last checkpoint first, so the
-                    # merge below never writes back an older task list or inventory.
-                    if self.g.word(7):
-                        await self._checkpoint(self.g.word(8))
+                    # The game merges tasks and arrays into its live state (campaign.inc), so no
+                    # fresh save is needed here: that save was a hitch whenever a friend moved rooms.
                     if p.get("pickups"):
                         self.inventory.add(p["pickups"])
                         p.setdefault("arrays", {})["collectables_found"] = list(
@@ -511,7 +576,9 @@ class Play:
                 last = data
             if self.host and (world := self.g.world_frame(last_world)):
                 last_world, raw = world
-                await self.w.send(b"W", zlib.compress(raw, 1))
+                delta = self.delta.encode(raw)
+                if delta:
+                    await self.w.send(b"W", zlib.compress(delta, 1))
             await asyncio.sleep(1 / 60)
         if self.g.word(7):
             await self.checkpoint(self.g.word(8))
@@ -524,7 +591,9 @@ class Play:
         while True:
             await asyncio.sleep(0.25)
             r = self.g.word(8)
-            if not self.g.word(7) or (room == r and time.monotonic() - last_time < 7):
+            # A checkpoint is a full save of the game (a visible hitch), so take one when the
+            # room changes (a loading moment anyway) and otherwise every three minutes.
+            if not self.g.word(7) or (room == r and time.monotonic() - last_time < 180):
                 continue
             await self.checkpoint(r)
             room = r
@@ -586,7 +655,7 @@ async def authenticate(r, w, secret, host):
     async with asyncio.timeout(6):
         if host:
             nonce = secrets.token_bytes(24)
-            w.write(b"WB02" + nonce)
+            w.write(b"WB03" + nonce)
             await w.drain()
             proof = await r.readexactly(32)
             if not hmac.compare_digest(
@@ -594,7 +663,7 @@ async def authenticate(r, w, secret, host):
             ):
                 raise ValueError("Неверное приглашение")
         else:
-            if await r.readexactly(4) != b"WB02":
+            if await r.readexactly(4) != b"WB03":
                 raise ValueError("Нужна та же версия мода")
             nonce = await r.readexactly(24)
             w.write(hmac.digest(secret, b"join" + nonce, "sha256"))
@@ -668,7 +737,7 @@ DENIED = {
     "full": "В мире уже есть гость",
     "closed": "Хост закрыл мир",
     "refused": "Хост не отвечает · пусть откроет мир заново",
-    "unreachable": "Не удалось достучаться до хоста через Steam",
+    "unreachable": "Мир не найден: приглашение устарело или хост закрыл мир - попросите новое",
     "wrong_password": "Приглашение устарело · попросите новое",
     "too_many_tries": "Слишком много попыток · подождите пару минут",
     "outdated": "Обновите Porthole в Steam",
