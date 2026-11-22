@@ -77,6 +77,23 @@ static void on_book_draw(void *self,void *other){
    where to follow them (journal map positions of caves and side rooms say little about the way). */
 static double lastSeenX, lastSeenY;
 static unsigned lastSeenRoom=~0u;
+/* The game's own doors and room exits (oRoomTransitionTrigger and its children) know where they
+   lead: the nearest one into the friend's room is the way to them, whoever left. */
+#define OBJ_oRoomTransitionTrigger 119
+#define V_target_room 0x18c91
+static int door_to(void *self,unsigned room,double *x,double *y){
+    if(!player)return 0;
+    double px=coord(player,B_x),py=coord(player,B_y),best=1e30;
+    Iterator it;void *door;
+    begin(&it,self,OBJ_oRoomTransitionTrigger);
+    while((door=next(&it))){
+        Val target=*field(door,V_target_room);
+        if(!isnum(target)||(unsigned)value(target)!=room)continue;
+        double dx=coord(door,B_x),dy=coord(door,B_y),d=hypot(dx-px,dy-py);
+        if(d<best){best=d;*x=dx;*y=dy;}
+    }
+    return best<1e30;
+}
 static void edge_marker(void *self){
     if(!peer_live() || mapVisible || exists(self,subId))return;
     double tx,ty;
@@ -84,6 +101,8 @@ static void edge_marker(void *self){
     if(incoming.room==bus->room){
         tx=incoming.x;ty=incoming.y;
         lastSeenX=tx;lastSeenY=ty;lastSeenRoom=bus->room;
+    }else if(door_to(self,incoming.room,&tx,&ty)){
+        away=1;
     }else if(lastSeenRoom==bus->room){
         tx=lastSeenX;ty=lastSeenY;away=1;
     }else return;
@@ -99,7 +118,7 @@ static void edge_marker(void *self){
         /* On screen: the friend is visible themselves; if they left, mark the way they went. */
         if(away){
             arrow(self,gx,gy-14-3*sin(GetTickCount()/170.0),0,1,22,peer_colour());
-            shadow_text(self,gx,gy-44,russian(io)?"Друг ушёл сюда":"Your friend went this way",0xffffff,1);
+            shadow_text(self,gx,gy-44,russian(io)?"Друг там":"Your friend is this way",0xffffff,1);
         }
     }else{
         double len=hypot(dx,dy),margin=18;

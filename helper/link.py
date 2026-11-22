@@ -24,7 +24,7 @@ from pathlib import Path
 PORT = 37942
 PORTHOLE_APP = 4963920
 INVITE = re.compile(r"WB3/([A-Za-z0-9]{4,32})/([A-Za-z0-9_-]{20,24})\Z")
-SPIDER = struct.Struct("<5I8f12I")
+SPIDER = struct.Struct("<5I8f12I2fI")
 HEAD = struct.Struct("<9I192s192s64s")
 LIMIT = 24 * 1024 * 1024
 ARRAYS = (
@@ -78,6 +78,11 @@ STRAND = struct.Struct("<4i4f2i4f12f")
 BODY = struct.Struct("<2i6f")
 BODY_START = WORLD_HEADER.size + 1536 * STRAND.size
 WORLD_SIZE = BODY_START + 768 * BODY.size
+TIES_HEADER = struct.Struct("<2I")
+TIE_MAX = 96
+CUT_RING = 64
+CUTS = struct.Struct(f"<I{CUT_RING}iI{CUT_RING}i")
+TIES_SIZE = TIES_HEADER.size + TIE_MAX * STRAND.size
 
 
 class Game:
@@ -89,6 +94,11 @@ class Game:
         if self.word(0) != 0x57425032:
             raise RuntimeError("Webbed не запущена")
         self.worldmem = mmap.mmap(-1, WORLD_SIZE, tagname=f"Local\\WebbedWorld_{pid}")
+        # Webs the guest tied to the host's spider (world.inc, "Ties").
+        self.tiesmem = mmap.mmap(-1, TIES_SIZE, tagname=f"Local\\WebbedTies_{pid}")
+        # Strands cut here that the other side owns, and the other way round (world.inc, "Cuts").
+        self.cutsmem = mmap.mmap(-1, CUTS.size, tagname=f"Local\\WebbedCuts_{pid}")
+        self.cuts_sent = struct.unpack_from("<I", self.cutsmem, 0)[0]
         self.lock = asyncio.Lock()
         self.serial = self.word(3) >> 8
         override = os.environ.get("WEBBED_COOP_PROFILE")  # QA copies with their own save folder
@@ -220,6 +230,46 @@ class Game:
         self.worldmem[BODY_START : BODY_START + m * BODY.size] = data[offset:]
         struct.pack_into("<I", self.worldmem, 0, seq)
 
+    def ties_frame(self, last):
+        seq, count = TIES_HEADER.unpack_from(self.tiesmem)
+        if seq & 1 or seq == last or count > TIE_MAX:
+            return None
+        data = self.tiesmem[: TIES_HEADER.size + count * STRAND.size]
+        if TIES_HEADER.unpack_from(self.tiesmem)[0] == seq:
+            return seq, data
+
+    def install_ties(self, data):
+        _, count = TIES_HEADER.unpack_from(data)
+        if count > TIE_MAX or len(data) != TIES_HEADER.size + count * STRAND.size:
+            raise ValueError("Пакет паутины")
+        for v in STRAND.iter_unpack(data[TIES_HEADER.size :]):
+            if any(not math.isfinite(x) or abs(x) > 1e8 for x in (*v[4:8], *v[10:])):
+                raise ValueError("Параметры паутины")
+        seq = (TIES_HEADER.unpack_from(self.tiesmem)[0] + 2) & 0xFFFFFFFE
+        TIES_HEADER.pack_into(self.tiesmem, 0, seq | 1, count)
+        self.tiesmem[TIES_HEADER.size : len(data)] = data[TIES_HEADER.size :]
+        TIES_HEADER.pack_into(self.tiesmem, 0, seq, count)
+
+    def new_cuts(self):
+        count = struct.unpack_from("<I", self.cutsmem, 0)[0]
+        if count - self.cuts_sent > CUT_RING:
+            self.cuts_sent = count - CUT_RING
+        ids = []
+        while self.cuts_sent != count:
+            ids.append(struct.unpack_from("<i", self.cutsmem, 4 + 4 * (self.cuts_sent % CUT_RING))[0])
+            self.cuts_sent = (self.cuts_sent + 1) & 0xFFFFFFFF
+        return ids
+
+    def install_cuts(self, data):
+        if len(data) % 4 or len(data) > 4 * CUT_RING:
+            raise ValueError("Пакет разрезов")
+        base = 4 + 4 * CUT_RING
+        count = struct.unpack_from("<I", self.cutsmem, base)[0]
+        for (i,) in struct.iter_unpack("<i", data):
+            struct.pack_into("<i", self.cutsmem, base + 4 + 4 * (count % CUT_RING), i)
+            count = (count + 1) & 0xFFFFFFFF
+        struct.pack_into("<I", self.cutsmem, base, count)
+
     def remote(self, data):
         if len(data) != SPIDER.size:
             raise ValueError("Размер кадра")
@@ -228,7 +278,8 @@ class Game:
             v[2] > 2  # 0 none, 1 playing, 2 paused
             or v[3] > 1024
             or v[4] > 63
-            or any(not math.isfinite(x) or abs(x) > 1e7 for x in v[5:13])
+            or any(not math.isfinite(x) or abs(x) > 1e7 for x in (*v[5:13], *v[25:27]))
+            or v[27] > 1
         ):
             raise ValueError("Недопустимое состояние паука")
         a = HEAD.size + SPIDER.size
@@ -529,6 +580,10 @@ class Play:
             kind, body = await self.w.recv()
             if kind == b"P":
                 self.g.remote(body)
+            elif kind == b"T" and self.host:
+                self.g.install_ties(zlib.decompressobj().decompress(body, TIES_SIZE + 1))
+            elif kind == b"X":
+                self.g.install_cuts(body)
             elif kind == b"W" and not self.host:
                 self.g.install_world(self.mirror.apply(zlib.decompress(body)))
             elif kind == b"Q":
@@ -569,7 +624,13 @@ class Play:
     async def frames(self):
         last = None
         last_world = 0
+        last_ties = 0
         while not self.g.word(5):
+            if not self.host and (ties := self.g.ties_frame(last_ties)):
+                last_ties, raw = ties
+                await self.w.send(b"T", zlib.compress(raw, 1))
+            if cuts := self.g.new_cuts():
+                await self.w.send(b"X", struct.pack(f"<{len(cuts)}i", *cuts))
             data = self.g.frame()
             if data and data != last:
                 await self.w.send(b"P", data)
@@ -655,7 +716,7 @@ async def authenticate(r, w, secret, host):
     async with asyncio.timeout(6):
         if host:
             nonce = secrets.token_bytes(24)
-            w.write(b"WB03" + nonce)
+            w.write(b"WB04" + nonce)
             await w.drain()
             proof = await r.readexactly(32)
             if not hmac.compare_digest(
@@ -663,7 +724,7 @@ async def authenticate(r, w, secret, host):
             ):
                 raise ValueError("Неверное приглашение")
         else:
-            if await r.readexactly(4) != b"WB03":
+            if await r.readexactly(4) != b"WB04":
                 raise ValueError("Нужна та же версия мода")
             nonce = await r.readexactly(24)
             w.write(hmac.digest(secret, b"join" + nonce, "sha256"))
@@ -927,21 +988,38 @@ async def link(pid, profile=None):
             # Only Porthole reaches the game port: it listens on loopback alone.
             server = await asyncio.start_server(join, "127.0.0.1", 0)
             local = server.sockets[0].getsockname()[1]
-            game.status(1, "Запускается Porthole...")
-            tunnel = Porthole(
-                exe,
-                [
-                    "expose",
-                    f"tcp/127.0.0.1:{local}:{PORT}",
-                    "--password",
-                    lobby_password(secret),
-                    "--name",
-                    "Webbed",
-                ],
-            )
+            tunnel = None
             try:
-                await tunnel.start()
-                ready = await tunnel.wait("server_ready", 60)
+                # Porthole sometimes quits before it reaches Steam (it is still releasing the
+                # previous tunnel, or Steam is busy): start it again a couple of times.
+                for attempt in range(1, 4):
+                    game.status(
+                        1,
+                        "Запускается Porthole..."
+                        if attempt == 1
+                        else f"Запускаю Porthole снова ({attempt}/3)...",
+                    )
+                    tunnel = Porthole(
+                        exe,
+                        [
+                            "expose",
+                            f"tcp/127.0.0.1:{local}:{PORT}",
+                            "--password",
+                            lobby_password(secret),
+                            "--name",
+                            "Webbed",
+                        ],
+                    )
+                    await tunnel.start()
+                    try:
+                        ready = await tunnel.wait("server_ready", 60)
+                        break
+                    except ConnectionError:
+                        await tunnel.close()
+                        tunnel = None
+                        if attempt == 3:
+                            raise
+                        await asyncio.sleep(3)
                 code = str(ready.get("code", ""))
                 invite = f"WB3/{code}/{token}"
                 if not INVITE.fullmatch(invite):
@@ -966,7 +1044,8 @@ async def link(pid, profile=None):
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
-                await tunnel.close()
+                if tunnel:
+                    await tunnel.close()
         else:
             match = INVITE.fullmatch(getstr(game.mem, 36, 192))
             if not match:
@@ -1062,4 +1141,6 @@ async def link(pid, profile=None):
         if process:
             k.CloseHandle(ctypes.c_void_p(process))
         game.worldmem.close()
+        game.tiesmem.close()
+        game.cutsmem.close()
         game.mem.close()

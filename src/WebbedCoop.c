@@ -1,5 +1,6 @@
 #include "build.h"
 #define F_instance_exists 0x11ab540
+#define F_draw_line_width_color 0x11d4340
 #define F_ds_map_create 0x11b3910
 #define F_array_length 0x117f2b0
 #define F_array_get 0x117f090
@@ -224,16 +225,25 @@ static void on_clean(void *self, void *other)
         remote = NULL;
     cleanPlayer(self, other);
 }
+static int newest_web(void *self);
+static void claim_new_webs(void *self, int newest);
 static int same_room(void)
 {
     return bus->status == CONNECTED && incoming.active && GetTickCount() - incoming.heartbeat < 1600 &&
            incoming.room == bus->room && !guestSlotPending;
 }
 static void on_step(void *self, void *other);
+/* The friend's spider here is a puppet of the real one: its position comes from the friend, and
+   the game's own code only animates it (legs, facing, dance, the grapple line). It never weaves:
+   the friend's webs arrive from the friend. On the host it also carries the friend's interact and
+   laser, so world objects (switches, webs to burn) react in the host's world, which owns them. */
 static void remote_event(Event orig, void *self, void *other)
 {
     double dx = incoming.hm, dy = incoming.vm, px = coord(self, B_x), py = coord(self, B_y);
-    unsigned b = incoming.buttons, pr = remotePress, rel = remoteRelease;
+    unsigned keep = (1u << 0) | (1u << 1) | (1u << 4); /* jump, grapple, dance */
+    if (bus->role == HOST)
+        keep |= (1u << 3) | (1u << 5); /* laser, interact */
+    unsigned b = incoming.buttons & keep, pr = remotePress & keep, rel = remoteRelease & keep;
     const int ids[] = {V_hm,
                        V_vm,
                        V_mvmag,
@@ -296,6 +306,66 @@ static void remote_event(Event orig, void *self, void *other)
     for (unsigned i = 0; i < sizeof(ids) / sizeof(*ids); i++)
         *field(io, ids[i]) = old[i];
 }
+/* Snapshot interpolation: the puppet is drawn 100 ms behind the friend's latest frame, between
+   the two frames around that moment, so it moves at the game's own frame rate however the
+   frames arrive. */
+#define SNAP_COUNT 32
+#define SNAP_DELAY 100
+typedef struct
+{
+    DWORD t;
+    double x, y, vx, vy;
+} Snap;
+static Snap snaps[SNAP_COUNT];
+static int snapCount;
+static void snap_push(const Spider *s)
+{
+    DWORD now = GetTickCount();
+    if (snapCount && hypot(s->x - snaps[snapCount - 1].x, s->y - snaps[snapCount - 1].y) > 96)
+        snapCount = 0; /* a door or a respawn: no gliding across the room */
+    if (snapCount == SNAP_COUNT)
+    {
+        memmove(snaps, snaps + 1, (SNAP_COUNT - 1) * sizeof(Snap));
+        snapCount--;
+    }
+    snaps[snapCount++] = (Snap){now, s->x, s->y, s->vx, s->vy};
+}
+static int snap_at(double *x, double *y, double *vx, double *vy)
+{
+    if (!snapCount)
+        return 0;
+    DWORD t = GetTickCount() - SNAP_DELAY;
+    if ((int)(t - snaps[0].t) <= 0)
+    {
+        *x = snaps[0].x, *y = snaps[0].y, *vx = snaps[0].vx, *vy = snaps[0].vy;
+        return 1;
+    }
+    for (int i = 1; i < snapCount; i++)
+        if ((int)(t - snaps[i].t) <= 0)
+        {
+            Snap *a = &snaps[i - 1], *b = &snaps[i];
+            DWORD span = b->t - a->t ? b->t - a->t : 1;
+            double k = (double)(t - a->t) / (double)span;
+            *x = a->x + (b->x - a->x) * k, *y = a->y + (b->y - a->y) * k;
+            *vx = a->vx + (b->vx - a->vx) * k, *vy = a->vy + (b->vy - a->vy) * k;
+            return 1;
+        }
+    /* Frames are late: carry on along the last velocity for a little while. */
+    Snap *l = &snaps[snapCount - 1];
+    double ahead = fmin((double)(t - l->t), 120) / (1000.0 / 60);
+    *x = l->x + l->vx * ahead, *y = l->y + l->vy * ahead, *vx = l->vx, *vy = l->vy;
+    return 1;
+}
+static void puppet_place(void *self)
+{
+    double x, y, vx, vy;
+    if (!snap_at(&x, &y, &vx, &vy))
+        return;
+    set_coord(self, B_phy_position_x, x);
+    set_coord(self, B_phy_position_y, y);
+    set_coord(self, B_phy_speed_x, vx);
+    set_coord(self, B_phy_speed_y, vy);
+}
 static void on_step(void *self, void *other)
 {
     if (self == player && same_room() && !remote && !adding)
@@ -306,7 +376,10 @@ static void on_step(void *self, void *other)
     }
     if (self != remote)
     {
+        int newest = self == player ? newest_web(self) : 0;
         stepPlayer(self, other);
+        if (self == player)
+            claim_new_webs(self, newest);
         return;
     }
     if (!same_room())
@@ -324,40 +397,10 @@ static void on_step(void *self, void *other)
         appliedSequence = incoming.sequence;
         return;
     }
+    puppet_place(self);
     if (io)
         remote_event(stepPlayer, self, other);
-    /* The friend's spider runs on their buttons here; each network frame says where it really is.
-       Small differences are eased in over a few frames instead of teleporting the spider, which
-       read as stutter; only a big jump (a door, a respawn) snaps. */
-    static double corrX, corrY;
-    if (incoming.sequence != appliedSequence)
-    {
-        appliedSequence = incoming.sequence;
-        double dx = incoming.x - coord(self, B_x), dy = incoming.y - coord(self, B_y);
-        if (fabs(dx) + fabs(dy) > 64)
-        {
-            set_coord(self, B_phy_position_x, incoming.x);
-            set_coord(self, B_phy_position_y, incoming.y);
-            set_coord(self, B_phy_speed_x, incoming.vx);
-            set_coord(self, B_phy_speed_y, incoming.vy);
-            corrX = corrY = 0;
-        }
-        else
-        {
-            corrX = dx;
-            corrY = dy;
-            set_coord(self, B_phy_speed_x, .5 * coord(self, B_phy_speed_x) + .5 * incoming.vx);
-            set_coord(self, B_phy_speed_y, .5 * coord(self, B_phy_speed_y) + .5 * incoming.vy);
-        }
-    }
-    if (fabs(corrX) + fabs(corrY) > .05)
-    {
-        double kx = corrX * .3, ky = corrY * .3;
-        set_coord(self, B_phy_position_x, coord(self, B_x) + kx);
-        set_coord(self, B_phy_position_y, coord(self, B_y) + ky);
-        corrX -= kx;
-        corrY -= ky;
-    }
+    puppet_place(self); /* the game's step moved it; the friend's position wins */
 }
 static void arrow(void *,double,double,double,double,double,int);
 static void shadow_text(void *, double, double, const char *, int, double);
@@ -390,7 +433,18 @@ static void on_draw(void *self, void *other)
 static void on_draw_end(void *self, void *other)
 {
     if (self == remote && io)
+    {
         remote_event(drawEndPlayer, self, other);
+        /* The strand the friend is weaving right now, from where it starts to their spider. */
+        if (incoming.flags & SPIDER_WEAVING)
+        {
+            Val alpha = FN0(self, draw_get_alpha);
+            FN(self, draw_set_alpha, num(.9));
+            FN(self, draw_line_width_color, num(incoming.wx), num(incoming.wy), num(coord(self, B_x)),
+               num(coord(self, B_y)), num(1), num(0xffffff), num(0xffffff));
+            FN(self, draw_set_alpha, alpha);
+        }
+    }
     else
         drawEndPlayer(self, other);
 }
@@ -431,6 +485,9 @@ static void network_frame(void *self)
         s.vm = read_field(self, V_vm);
         s.mx = read_field(self, V_mx);
         s.my = read_field(self, V_my);
+        s.flags = read_field(self, V_weave) != 0 ? SPIDER_WEAVING : 0;
+        s.wx = read_field(player, V_ox);
+        s.wy = read_field(player, V_oy);
         const int ids[] = {V_jmp_held, V_grapple, V_weave, V_laser, V_dance, V_interact_held};
         unsigned old = s.buttons;
         s.buttons = 0;
@@ -460,7 +517,11 @@ static void network_frame(void *self)
     Spider peer = bus->remote;
     MemoryBarrier();
     if (!(version & 1) && version == bus->remote.sequence)
+    {
+        if (peer.sequence != incoming.sequence && peer.active)
+            snap_push(&peer);
         incoming = peer;
+    }
     remotePress = remoteRelease = 0;
     for (unsigned i = 0; i < 6; i++)
     {

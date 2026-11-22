@@ -7,7 +7,10 @@ typedef struct
     uint32_t sequence, heartbeat, active, room, buttons;
     float x, y, vx, vy, hm, vm, mx, my;
     uint32_t down[6], up[6];
+    float wx, wy;   /* where the web being woven starts (flags & SPIDER_WEAVING) */
+    uint32_t flags;
 } Spider;
+#define SPIDER_WEAVING 1u
 typedef struct
 {
     uint32_t magic, role, status, request, ack, disconnect, pulse, playing, room;

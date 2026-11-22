@@ -90,6 +90,8 @@ static int mobile_type(int t)
             return 1;
     return 0;
 }
+static int is_tie_web(int id);
+static void fill_strand(void *self, void *p, Strand *s);
 static void publish_world(void *self)
 {
     unsigned seq = (worldData->version & ~1u) + 2;
@@ -108,13 +110,11 @@ static void publish_world(void *self)
             worldData->complete = 0;
             break;
         }
+        if (is_tie_web(instance_id(p)))
+            continue;
         Strand *s = &worldData->web[worldData->numWebs++];
         s->id = instance_id(p);
-        s->colour = (int)coord(p, B_image_blend);
-        s->o = endpoint(self, *field(p, V_o));
-        s->a = endpoint(self, *field(p, V_a));
-        for (int j = 0; j < 12; j++)
-            s->props[j] = (float)read_field(p, webFields[j]);
+        fill_strand(self, p, s);
     }
     begin(&it, self, 69);
     while ((p = next(&it)) && worldData->numBodies < BODY_MAX)
@@ -230,6 +230,279 @@ static int resolve_anchor(void *self, Endpoint e)
         bind_id(nodeBindings, &nodeCount, WEB_MAX * 2, e.id, best);
     return best;
 }
+static void fill_strand(void *self, void *p, Strand *s)
+{
+    s->id = instance_id(p);
+    s->colour = (int)coord(p, B_image_blend);
+    s->o = endpoint(self, *field(p, V_o));
+    s->a = endpoint(self, *field(p, V_a));
+    for (int j = 0; j < 12; j++)
+        s->props[j] = (float)read_field(p, webFields[j]);
+}
+/* ---- Ownership. Each player's game is the authority for the webs that player makes, as for an
+   NPC's own body: the host's world carries the host's webs (and the level's), and the guest sends
+   the webs it spun ("ties"), which the host creates and keeps out of its world list. Whoever cuts a
+   strand asks its owner to remove it, and the pieces left after the cut belong to the one who cut. */
+#define TIE_MAX 96
+#define OWN_MAX 128
+typedef struct
+{
+    uint32_t version, count;
+    Strand s[TIE_MAX];
+} Ties;
+static Ties *tiesData;
+static Ties incomingTies;
+static HANDLE tiesMapping;
+static int tieIds[TIE_MAX], tieIdCount; /* guest: the webs it sent; host: webs made from them */
+static int tieSource[TIE_MAX];          /* host: the guest's strand id for each */
+static unsigned lastTies, tieRoom = ~0u;
+static int ownIds[OWN_MAX], ownCount; /* guest: webs its own spider spun */
+static int is_own(int id)
+{
+    for (int i = 0; i < ownCount; i++)
+        if (ownIds[i] == id)
+            return 1;
+    return 0;
+}
+static int is_tie_web(int id)
+{
+    for (int i = 0; i < tieIdCount; i++)
+        if (tieIds[i] == id)
+            return 1;
+    return bus->role == GUEST && is_own(id);
+}
+static int bound_local(int id)
+{
+    for (int i = 0; i < webCount; i++)
+        if (webBindings[i].local == id)
+            return 1;
+    return 0;
+}
+/* Instance ids only grow, so a web newer than the newest one before the spider's step was spun
+   (or split off by a cut) during that step. */
+static int newest_web(void *self)
+{
+    if (bus->role != GUEST || bus->status != CONNECTED)
+        return -1;
+    int newest = 0;
+    Iterator it;
+    void *p;
+    begin(&it, self, 107);
+    while ((p = next(&it)))
+    {
+        int id = instance_id(p);
+        if (id > newest)
+            newest = id;
+    }
+    return newest;
+}
+static void forget_dead_own(void *self)
+{
+    int n = 0;
+    for (int i = 0; i < ownCount; i++)
+    {
+        void *p = find_id(self, ownIds[i]);
+        if (p && object_type(p) == 107)
+            ownIds[n++] = ownIds[i];
+    }
+    ownCount = n;
+}
+static void claim_new_webs(void *self, int newest)
+{
+    if (newest < 0)
+        return;
+    Iterator it;
+    void *p;
+    begin(&it, self, 107);
+    while ((p = next(&it)))
+    {
+        int id = instance_id(p);
+        if (id <= newest || is_own(id))
+            continue;
+        if (ownCount == OWN_MAX)
+            forget_dead_own(self);
+        if (ownCount < OWN_MAX)
+            ownIds[ownCount++] = id;
+    }
+}
+/* ---- Cuts: strand ids for the other side to remove. The game appends to "out", the network
+   helper to "in"; each side only ever moves its own counter forward. ---- */
+#define CUT_RING 64
+typedef struct
+{
+    uint32_t outCount;
+    int32_t out[CUT_RING];
+    uint32_t inCount;
+    int32_t in[CUT_RING];
+} Cuts;
+static Cuts *cutsData;
+static HANDLE cutsMapping;
+static uint32_t cutsSeen;
+typedef struct
+{
+    int id;
+    DWORD until;
+} Hold;
+static Hold holds[64];
+static void send_cut(int id)
+{
+    if (!cutsData)
+        return;
+    cutsData->out[cutsData->outCount % CUT_RING] = id;
+    MemoryBarrier();
+    cutsData->outCount++;
+}
+/* A strand just cut here stays cut while the owner hears about it (a round trip or two). */
+static void hold(int id)
+{
+    int slot = 0;
+    DWORD now = GetTickCount();
+    for (int i = 0; i < 64; i++)
+        if ((int)(holds[i].until - now) < (int)(holds[slot].until - now))
+            slot = i;
+    holds[slot] = (Hold){id, now + 1500};
+}
+static int held(int id)
+{
+    DWORD now = GetTickCount();
+    for (int i = 0; i < 64; i++)
+        if (holds[i].id == id && (int)(holds[i].until - now) > 0)
+            return 1;
+    return 0;
+}
+static void receive_cuts(void *self)
+{
+    if (!cutsData)
+        return;
+    uint32_t count = cutsData->inCount;
+    MemoryBarrier();
+    if (count - cutsSeen > CUT_RING)
+        cutsSeen = count - CUT_RING;
+    for (; cutsSeen != count; cutsSeen++)
+    {
+        int id = cutsData->in[cutsSeen % CUT_RING];
+        void *p = find_id(self, id);
+        if (!p || object_type(p) != 107)
+            continue;
+        /* Only the owner's copy goes: the guest removes what it spun, the host what its world has. */
+        if (bus->role == GUEST ? !is_tie_web(id) : is_tie_web(id))
+            continue;
+        hold(id);
+        FN0(p, instance_destroy);
+    }
+}
+static void publish_ties(void *self)
+{
+    if (!tiesData)
+        return;
+    double rid = remote ? coord(remote, B_id) : -1e9;
+    forget_dead_own(self);
+    int fresh[TIE_MAX], freshCount = 0;
+    unsigned seq = (tiesData->version & ~1u) + 2;
+    tiesData->version = seq - 1;
+    MemoryBarrier();
+    tiesData->count = 0;
+    Iterator it;
+    void *p;
+    begin(&it, self, 107);
+    while ((p = next(&it)) && tiesData->count < TIE_MAX)
+    {
+        int id = instance_id(p);
+        /* Ours: what our spider spun, and webs on the friend's spider that are not from the host. */
+        if (!is_own(id) &&
+            ((value(*field(p, V_o)) != rid && value(*field(p, V_a)) != rid) || (!is_tie_web(id) && bound_local(id))))
+            continue;
+        fresh[freshCount++] = id;
+        fill_strand(self, p, &tiesData->s[tiesData->count++]);
+    }
+    memcpy(tieIds, fresh, freshCount * sizeof(int));
+    tieIdCount = freshCount;
+    MemoryBarrier();
+    tiesData->version = seq;
+}
+static void apply_ties(void *self)
+{
+    if (!tiesData)
+        return;
+    if (tieRoom != bus->room)
+    {
+        tieIdCount = 0; /* new room: the old ones went with it */
+        tieRoom = bus->room;
+    }
+    /* A tie that vanished here was cut by the host's spider: tell the guest, who owns it. */
+    for (int j = 0; j < tieIdCount; j++)
+    {
+        void *p = find_id(self, tieIds[j]);
+        if ((!p || object_type(p) != 107) && !held(tieSource[j]))
+        {
+            send_cut(tieSource[j]);
+            hold(tieSource[j]);
+        }
+    }
+    unsigned seq = tiesData->version;
+    if (seq & 1 || seq == lastTies)
+        return;
+    MemoryBarrier();
+    memcpy(&incomingTies, tiesData, sizeof(Ties));
+    MemoryBarrier();
+    if (seq != tiesData->version || incomingTies.count > TIE_MAX)
+        return;
+    lastTies = seq;
+    int keepIds[TIE_MAX], keepSource[TIE_MAX], keep = 0;
+    for (unsigned i = 0; i < incomingTies.count; i++)
+    {
+        Strand *s = &incomingTies.s[i];
+        if (held(s->id))
+            continue;
+        void *p = NULL;
+        for (int j = 0; j < tieIdCount; j++)
+            if (tieSource[j] == s->id)
+            {
+                p = find_id(self, tieIds[j]);
+                if (p && object_type(p) != 107)
+                    p = NULL;
+                break;
+            }
+        if (!p)
+        {
+            int o = resolve_anchor(self, s->o), a = resolve_anchor(self, s->a);
+            if ((s->o.type >= 0 && o < 0) || (s->a.type >= 0 && a < 0))
+                continue;
+            GameString layer;
+            Val id = FN(self, instance_create_layer, num(s->props[0]), num(s->props[1]), str(&layer, "Webs"), num(107));
+            p = find_id(self, (int)value(id));
+            if (!p)
+                continue;
+            *field(p, V_o) = num(o);
+            *field(p, V_a) = num(a);
+            for (int j = 0; j < 12; j++)
+                *field(p, webFields[j]) = num(s->props[j]);
+            set_coord(p, B_image_blend, s->colour);
+            Val created = num(instance_id(p));
+            script(p, 0x4df040, 1, &created);
+        }
+        else
+            *field(p, V_length) = num(s->props[8]);
+        if (keep < TIE_MAX)
+        {
+            keepIds[keep] = instance_id(p);
+            keepSource[keep++] = s->id;
+        }
+    }
+    /* Ties the guest no longer has (cut on its side) go here too. */
+    for (int j = 0; j < tieIdCount; j++)
+    {
+        int still = 0;
+        for (int k = 0; k < keep; k++)
+            still |= keepIds[k] == tieIds[j];
+        void *p = still ? NULL : find_id(self, tieIds[j]);
+        if (p && object_type(p) == 107)
+            FN0(p, instance_destroy);
+    }
+    memcpy(tieIds, keepIds, keep * sizeof(int));
+    memcpy(tieSource, keepSource, keep * sizeof(int));
+    tieIdCount = keep;
+}
 typedef struct
 {
     int id, used;
@@ -259,14 +532,24 @@ static void apply_world(void *self)
         nodeCount = webCount = 0;
         knownRoom = w->room;
     }
+    for (int i = 0; i < webCount; i++)
+    {
+        Binding old = webBindings[i];
+        void *gone = old.local >= 100000 ? find_id(self, old.local) : (void *)1;
+        if ((!gone || object_type(gone) != 107) && !held(old.host))
+        {
+            send_cut(old.host);
+            hold(old.host);
+        }
+    }
     Iterator it;
     begin(&it, self, 107);
     void *p;
     int n = 0;
     while (n < WEB_MAX && (p = next(&it)))
     {
-        localWebs[n++] = (LocalWeb){
-            instance_id(p), 0, read_field(p, V_ox), read_field(p, V_oy), read_field(p, V_ax), read_field(p, V_ay)};
+        localWebs[n++] = (LocalWeb){instance_id(p),   is_tie_web(instance_id(p)), read_field(p, V_ox),
+                                    read_field(p, V_oy), read_field(p, V_ax),   read_field(p, V_ay)};
     }
     static Binding fresh[WEB_MAX];
     int count = 0;
@@ -279,6 +562,8 @@ static void apply_world(void *self)
     for (unsigned i = 0; i < w->numWebs; i++)
     {
         Strand *s = &w->web[i];
+        if (held(s->id))
+            continue;
         int target = table_get(&bindingByHost, s->id, -4);
         int match = target >= 100000 ? table_get(&localById, target, -1) : -1;
         if (match >= 0 && localWebs[match].used)
@@ -380,9 +665,13 @@ static void apply_world(void *self)
 }
 static void sync_world(void *self)
 {
+    if (bus->role)
+        receive_cuts(self);
     if (!worldData || !same_room() || !remote)
     {
         knownRoom = ~0u;
+        if (bus->role == HOST)
+            tieIdCount = 0; /* the guest left: what it spun here stays as part of the room */
         return;
     }
     /* Pausing deactivates every instance: a world read now would have no webs, and one applied now
@@ -392,7 +681,13 @@ static void sync_world(void *self)
     if (bus->role == HOST && menuTick % 4 == 0)
         publish_world(self);
     if (bus->role == GUEST)
+    {
         apply_world(self);
+        if (menuTick % 4 == 2)
+            publish_ties(self);
+    }
+    else
+        apply_ties(self);
 }
 static void open_world_map(void)
 {
@@ -401,4 +696,12 @@ static void open_world_map(void)
     worldMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(World), name);
     if (worldMapping)
         worldData = MapViewOfFile(worldMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(World));
+    swprintf(name, 80, L"Local\\WebbedTies_%lu", GetCurrentProcessId());
+    tiesMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(Ties), name);
+    if (tiesMapping)
+        tiesData = MapViewOfFile(tiesMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Ties));
+    swprintf(name, 80, L"Local\\WebbedCuts_%lu", GetCurrentProcessId());
+    cutsMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(Cuts), name);
+    if (cutsMapping)
+        cutsData = MapViewOfFile(cutsMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Cuts));
 }

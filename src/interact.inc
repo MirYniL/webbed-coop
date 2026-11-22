@@ -31,10 +31,12 @@ static void *other_spider(void *self)
 {
     if (!bus || bus->status != CONNECTED || !player || !remote || !same_room())
         return NULL;
+    /* Only the real owner of a spider acts on the friend: the remote copy (replaying the friend's
+       buttons) never touches the local spider. What the friend does to us arrives as their own
+       result instead (their webs via the tie channel and world sync, their pushes via positions),
+       so nothing is solved twice and the pair is not flung around. */
     if (self == player)
         return remote;
-    if (self == remote)
-        return player;
     return NULL;
 }
 #define SPIDER_RADIUS 7.0
@@ -73,6 +75,31 @@ static double segment_circle(double ax, double ay, double bx, double by, double 
         return 0; /* starts inside */
     return -1;
 }
+/* The same for a square of half-size r: a flat back, so a spider can stand on the friend the way
+   it stands on a box instead of sliding off a ball. */
+static double segment_box(double ax, double ay, double bx, double by, double cx, double cy, double r)
+{
+    double lo = 0, hi = 1, d[2] = {bx - ax, by - ay}, s[2] = {ax - cx, ay - cy};
+    for (int k = 0; k < 2; k++)
+    {
+        if (fabs(d[k]) < 1e-9)
+        {
+            if (fabs(s[k]) > r)
+                return -1;
+            continue;
+        }
+        double t1 = (-r - s[k]) / d[k], t2 = (r - s[k]) / d[k];
+        if (t1 > t2)
+        {
+            double t = t1;
+            t1 = t2, t2 = t;
+        }
+        lo = fmax(lo, t1), hi = fmin(hi, t2);
+        if (lo > hi)
+            return -1;
+    }
+    return lo;
+}
 static int webs_on(void *self, void *spider)
 {
     double id = coord(spider, B_id);
@@ -96,19 +123,18 @@ static Val *coop_raycast(void *self, void *other, Val *ret, int argc, Val **argv
            local spider, or both machines would push the pair against each other and fling them.
            Long rays are aiming: those see the other spider everywhere, so a grapple or web on a
            friend lands the same on both screens. */
-        int shortRay = hypot(bx - ax, by - ay) < 48;
-        if (self == remote && shortRay)
-            friendSpider = NULL;
         /* A friend moves a little all the time, so a held weave would tie a strand to them on
            every frame: three strands on one spider is plenty. */
-        else if (!shortRay && webs_on(self, friendSpider) >= 3)
+        if (hypot(bx - ax, by - ay) >= 48 && webs_on(self, friendSpider) >= 3)
             friendSpider = NULL;
     }
     if (friendSpider && argc >= 5 && solid_query(self, *argv[4]))
     {
         double ax = value(*argv[0]), ay = value(*argv[1]), bx = value(*argv[2]), by = value(*argv[3]);
         double cx = coord(friendSpider, B_x), cy = coord(friendSpider, B_y);
-        double t = segment_circle(ax, ay, bx, by, cx, cy, SPIDER_RADIUS);
+        /* Feet and sides meet a flat box; aiming (long rays) the round body. */
+        double t = hypot(bx - ax, by - ay) < 48 ? segment_box(ax, ay, bx, by, cx, cy, SPIDER_RADIUS)
+                                                : segment_circle(ax, ay, bx, by, cx, cy, SPIDER_RADIUS);
         if (t >= 0)
         {
             double hx = ax + (bx - ax) * t, hy = ay + (by - ay) * t, hitDist = hypot(hx - ax, hy - ay);
@@ -308,8 +334,43 @@ static void draw_hearts(void *self)
     }
     FN(self, draw_set_alpha, alpha);
 }
+/* ---- Bodies. The raycasts above let this player's spider stand on the friend and bump into
+   them; this covers the rest. When the friend walks into us we are pushed aside a little at a time
+   (as spiders shove bugs), and when we stand on the friend's back we ride along with them. ---- */
+static double riderLastX, riderLastY;
+static int riderValid;
+static void body_contact(void)
+{
+    if (!player || !remote || !same_room() || incoming.active != SPIDER_PLAYING)
+    {
+        riderValid = 0;
+        return;
+    }
+    double px = coord(player, B_x), py = coord(player, B_y), fx = coord(remote, B_x), fy = coord(remote, B_y);
+    double dx = px - fx, dy = py - fy, d = hypot(dx, dy), nx = px, ny = py;
+    if (d < 13 && d > .01)
+    {
+        double k = fmin(13 - d, 1.5) / d;
+        nx += dx * k;
+        ny += dy * k;
+    }
+    /* On the friend's back: their step carries us. */
+    if (riderValid && dy < -6 && dy > -18 && fabs(dx) < 10)
+    {
+        double mx = fx - riderLastX, my = fy - riderLastY;
+        if (hypot(mx, my) < 12)
+            nx += mx, ny += my;
+    }
+    riderLastX = fx, riderLastY = fy, riderValid = 1;
+    if (nx != px || ny != py)
+    {
+        set_coord(player, B_phy_position_x, nx);
+        set_coord(player, B_phy_position_y, ny);
+    }
+}
 static void interaction_step(void *self)
 {
+    body_contact();
     rope_pull(self);
     hearts_step(self);
 }
