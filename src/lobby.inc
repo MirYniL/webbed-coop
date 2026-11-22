@@ -58,9 +58,11 @@ static void start_link(int role)
         snprintf(bus->status_text, 192, "%s", T("Сначала загрузите сохранение", "Load a save first"));
         return;
     }
-    wchar_t exe[MAX_PATH], cmd[2 * MAX_PATH];
-    swprintf(exe, MAX_PATH, L"%ls\\WebbedCoopLink.exe", runtimeDir);
-    swprintf(cmd, 2 * MAX_PATH, L"\"%ls\" --link %lu", exe, GetCurrentProcessId());
+    /* The network helper runs on the signed CPython runtime the installer put in WebbedCoop\. */
+    wchar_t exe[MAX_PATH], cmd[3 * MAX_PATH];
+    swprintf(exe, MAX_PATH, L"%ls\\WebbedCoop\\pythonw.exe", runtimeDir);
+    swprintf(cmd, 3 * MAX_PATH, L"\"%ls\" \"%ls\\WebbedCoop\\app\\coop.py\" --link %lu", exe, runtimeDir,
+             GetCurrentProcessId());
     STARTUPINFOW si = {.cb = sizeof(si)};
     PROCESS_INFORMATION pi = {0};
     if (role == HOST)
