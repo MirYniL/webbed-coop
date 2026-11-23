@@ -204,7 +204,7 @@ static void node_table(void)
 /* A strand's end on a web node: that node is the owner's. */
 static void steer_endpoint(void *self, const Endpoint *e)
 {
-    if (e->type != 101 && e->type != 105)
+    if (e->type != 101 && e->type != 105 && e->type != 106)
         return;
     int local = table_get(&nodeByHost, e->id, -1);
     if (local < 100000 && e->id <= LAST_PLACED_ID)
@@ -265,7 +265,8 @@ static int resolve_anchor(void *self, Endpoint e)
             distance = dist;
         }
     }
-    if (best == -4 && (e.type == 101 || e.type == 105))
+    /* Web nodes, and the node a grapple shot leaves (oWebshotNode): the grapple line is a web to it. */
+    if (best == -4 && (e.type == 101 || e.type == 105 || e.type == 106))
     {
         GameString layer;
         Val v = FN(self, instance_create_layer, num(e.x), num(e.y), str(&layer, "Webs"), num(e.type));

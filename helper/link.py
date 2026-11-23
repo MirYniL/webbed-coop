@@ -24,7 +24,7 @@ from pathlib import Path
 PORT = 37942
 PORTHOLE_APP = 4963920
 INVITE = re.compile(r"WB3/([A-Za-z0-9]{4,32})/([A-Za-z0-9_-]{20,24})\Z")
-SPIDER = struct.Struct("<5I8f12I2fI2d")
+SPIDER = struct.Struct("<5I8f12I2fI2d3f")
 HEAD = struct.Struct("<9I192s192s64s")
 LIMIT = 24 * 1024 * 1024
 ARRAYS = (
@@ -284,8 +284,9 @@ class Game:
             or v[3] > 1024
             or v[4] > 63
             or any(not math.isfinite(x) or abs(x) > 1e7 for x in (*v[5:13], *v[25:27]))
-            or v[27] > 1
+            or v[27] > 3
             or any(not math.isfinite(x) or abs(x) > 1e12 for x in v[28:30])
+            or any(not math.isfinite(x) or abs(x) > 1e7 for x in v[30:33])
         ):
             raise ValueError("Недопустимое состояние паука")
         a = HEAD.size + SPIDER.size

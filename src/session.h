@@ -14,8 +14,11 @@ typedef struct
     /* Every push the game gave this player's copy of the friend's spider so far (impulses, and
        forces times the step): the friend's game applies the growth to the real spider. */
     double ix, iy;
+    float gx, gy; /* the rope draw_spider draws: from (wx, wy) to (gx, gy) with this slack */
+    float slack;
 } Spider;
-#define SPIDER_WEAVING 1u
+#define SPIDER_WEAVING 1u  /* the spider's own weave/grapple state: draw_spider draws its rope */
+#define SPIDER_GRAPPLING 2u
 typedef struct
 {
     uint32_t magic, role, status, request, ack, disconnect, pulse, playing, room;

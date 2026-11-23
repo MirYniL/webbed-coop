@@ -201,6 +201,9 @@ static double dir(double x, double y)
     return d < 0 ? d + 360 : d;
 }
 #define V_grabbable 0x188f6
+#define V_slack 0x18c0a
+#define V_gx 0x18908
+#define V_gy 0x18909
 #define V_attached_webs 0x186ea
 static void on_create(void *self, void *other)
 {
@@ -427,7 +430,24 @@ static void on_draw(void *self, void *other)
     int tint = soft_colour(peer_colour(), .6);
     double blend = coord(self, B_image_blend);
     set_coord(self, B_image_blend, tint);
+    /* The game draws the grapple and weave rope in draw_spider from the spider's own state; for the
+       copy that state is the friend's, for this draw only (its step must never act on it). */
+    int ids[] = {V_grapple, V_weave, V_gx, V_gy, V_ox, V_oy, V_slack};
+    Val saved[7];
+    for (int i = 0; i < 7; i++)
+        saved[i] = *field(self, ids[i]);
+    /* The rope leaves the copy where it leaves the friend's spider (the copy is drawn a moment
+       behind, so the offset, not the friend's absolute point). */
+    *field(self, V_ox) = num(coord(self, B_x) + incoming.wx - incoming.x);
+    *field(self, V_oy) = num(coord(self, B_y) + incoming.wy - incoming.y);
+    *field(self, V_slack) = num(incoming.slack);
+    *field(self, V_grapple) = num((incoming.flags & SPIDER_GRAPPLING) != 0);
+    *field(self, V_weave) = num((incoming.flags & SPIDER_WEAVING) != 0);
+    *field(self, V_gx) = num(incoming.gx);
+    *field(self, V_gy) = num(incoming.gy);
     remote_event(drawPlayer, self, other);
+    for (int i = 0; i < 7; i++)
+        *field(self, ids[i]) = saved[i];
     set_coord(self, B_image_blend, blend);
     double x = coord(self, B_x), y = coord(self, B_y) - 17;
     Val alpha=FN0(self,draw_get_alpha);
@@ -444,15 +464,6 @@ static void on_draw_end(void *self, void *other)
     if (self == remote && io)
     {
         remote_event(drawEndPlayer, self, other);
-        /* The strand the friend is weaving right now, from where it starts to their spider. */
-        if (incoming.flags & SPIDER_WEAVING)
-        {
-            Val alpha = FN0(self, draw_get_alpha);
-            FN(self, draw_set_alpha, num(.9));
-            FN(self, draw_line_width_color, num(incoming.wx), num(incoming.wy), num(coord(self, B_x)),
-               num(coord(self, B_y)), num(1), num(0xffffff), num(0xffffff));
-            FN(self, draw_set_alpha, alpha);
-        }
     }
     else
         drawEndPlayer(self, other);
@@ -494,9 +505,13 @@ static void network_frame(void *self)
         s.vm = read_field(self, V_vm);
         s.mx = read_field(self, V_mx);
         s.my = read_field(self, V_my);
+        s.slack = read_field(player, V_slack);
+        s.gx = read_field(player, V_gx);
+        s.gy = read_field(player, V_gy);
         s.ix = pushX;
         s.iy = pushY;
-        s.flags = read_field(self, V_weave) != 0 ? SPIDER_WEAVING : 0;
+        s.flags = (read_field(player, V_weave) != 0 ? SPIDER_WEAVING : 0) |
+                  (read_field(player, V_grapple) != 0 ? SPIDER_GRAPPLING : 0);
         s.wx = read_field(player, V_ox);
         s.wy = read_field(player, V_oy);
         const int ids[] = {V_jmp_held, V_grapple, V_weave, V_laser, V_dance, V_interact_held};

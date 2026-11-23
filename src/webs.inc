@@ -25,9 +25,9 @@ static Val *coop_snap(void *self, void *other, Val *ret, int argc, Val **argv)
     if (bus && bus->status == CONNECTED && argc >= 1)
     {
         void *web = find_id(self, (int)value(*argv[0]));
-        /* A strand on a spider does not snap by itself, and one the friend owns snaps only in the
-           friend's game (the pieces come with the sync), or it would snap twice. */
-        if (web && object_type(web) == 107 && (on_spider(web) || (same_room() && !owned_here(instance_id(web)))))
+        /* A strand the friend owns snaps only in the friend's game (the pieces come with the sync),
+           or it would snap twice; ours snap by the game's own rules, on spiders as on bugs. */
+        if (web && object_type(web) == 107 && same_room() && !owned_here(instance_id(web)))
         {
             *ret = no_pieces(self);
             return ret;
@@ -223,17 +223,15 @@ static int install_push_hooks(void)
     return ok;
 }
 
-/* ---- Webs the friend tied to this player's spider. A bug with webs on it is damped harder per
-   web and cannot run off; a spider tied by the friend gets the same: heavier going per strand,
-   and a strand that is already taut does not stretch further (it pulls back softly, through the
-   speed the physics uses, never by moving the spider). The friend reeling it in arrives as pushes. */
+/* ---- Webs the friend tied to this player's spider work as on a bug (oGrabbable): every strand
+   damps the spider's speed, so a well-tied spider can hardly move. Nothing else holds it: the
+   friend pulls with their grapple (that arrives as pushes), and a strand stretched too far snaps
+   in the game of the one who made it, as webs on bugs do. ---- */
 static void webs_on_me(void *self)
 {
     if (!player || !bus || bus->status != CONNECTED || !remote || !same_room())
         return;
     double me = coord(player, B_id);
-    double px = coord(player, B_x), py = coord(player, B_y);
-    double vx = coord(player, B_phy_speed_x), vy = coord(player, B_phy_speed_y);
     int n = 0;
     Iterator it;
     void *web;
@@ -241,25 +239,14 @@ static void webs_on_me(void *self)
     while ((web = next(&it)))
     {
         double o = value(*field(web, V_o)), a = value(*field(web, V_a));
-        int isO = o == me, isA = a == me;
-        if ((!isO && !isA) || owned_here(instance_id(web)))
-            continue;
-        n++;
-        double tx = read_field(web, isO ? V_ax : V_ox), ty = read_field(web, isO ? V_ay : V_oy);
-        double length = read_field(web, V_length), dist = hypot(tx - px, ty - py);
-        if (length <= 0 || dist <= length || dist < 1e-6)
-            continue;
-        double nx = (tx - px) / dist, ny = (ty - py) / dist, outward = -(vx * nx + vy * ny);
-        if (outward > 0)
-            vx += nx * outward, vy += ny * outward;
-        double back = fmin((dist - length) * .05, 1.5);
-        vx += nx * back, vy += ny * back;
+        if ((o == me || a == me) && !owned_here(instance_id(web)))
+            n++;
     }
     if (!n)
         return;
     double keep = 1 / (1 + .03 * fmin(n, 6));
-    set_coord(player, B_phy_speed_x, vx * keep);
-    set_coord(player, B_phy_speed_y, vy * keep);
+    set_coord(player, B_phy_speed_x, coord(player, B_phy_speed_x) * keep);
+    set_coord(player, B_phy_speed_y, coord(player, B_phy_speed_y) * keep);
 }
 
 static void webs_step(void *self)
