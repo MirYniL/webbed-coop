@@ -225,8 +225,10 @@ static void on_clean(void *self, void *other)
         remote = NULL;
     cleanPlayer(self, other);
 }
-static int newest_web(void *self);
-static void claim_new_webs(void *self, int newest);
+static double pushX, pushY;
+static int puppetEvent;
+static int newest_bullet(void *self);
+static void mark_puppet_bullets(void *self, int before); /* the friend's copy is running its own events: its own forces are not pushes */
 static int same_room(void)
 {
     return bus->status == CONNECTED && incoming.active && GetTickCount() - incoming.heartbeat < 1600 &&
@@ -240,9 +242,11 @@ static void on_step(void *self, void *other);
 static void remote_event(Event orig, void *self, void *other)
 {
     double dx = incoming.hm, dy = incoming.vm, px = coord(self, B_x), py = coord(self, B_y);
-    unsigned keep = (1u << 0) | (1u << 1) | (1u << 4); /* jump, grapple, dance */
+    /* Jump, grapple, dance. The friend's shots are fired in the friend's game (what they hit there
+       reaches us as cuts and pushes), and interact on the host, whose world has the switches. */
+    unsigned keep = (1u << 0) | (1u << 1) | (1u << 4);
     if (bus->role == HOST)
-        keep |= (1u << 3) | (1u << 5); /* laser, interact */
+        keep |= 1u << 5;
     unsigned b = incoming.buttons & keep, pr = remotePress & keep, rel = remoteRelease & keep;
     const int ids[] = {V_hm,
                        V_vm,
@@ -302,15 +306,17 @@ static void remote_event(Event orig, void *self, void *other)
         old[i] = *v;
         *v = num(vars[i]);
     }
+    puppetEvent++;
     orig(self, other);
+    puppetEvent--;
     for (unsigned i = 0; i < sizeof(ids) / sizeof(*ids); i++)
         *field(io, ids[i]) = old[i];
 }
-/* Snapshot interpolation: the puppet is drawn 100 ms behind the friend's latest frame, between
+/* Snapshot interpolation: the puppet is drawn 60 ms behind the friend's latest frame, between
    the two frames around that moment, so it moves at the game's own frame rate however the
    frames arrive. */
 #define SNAP_COUNT 32
-#define SNAP_DELAY 100
+#define SNAP_DELAY 60
 typedef struct
 {
     DWORD t;
@@ -376,10 +382,7 @@ static void on_step(void *self, void *other)
     }
     if (self != remote)
     {
-        int newest = self == player ? newest_web(self) : 0;
         stepPlayer(self, other);
-        if (self == player)
-            claim_new_webs(self, newest);
         return;
     }
     if (!same_room())
@@ -399,7 +402,11 @@ static void on_step(void *self, void *other)
     }
     puppet_place(self);
     if (io)
+    {
+        int before = newest_bullet(self);
         remote_event(stepPlayer, self, other);
+        mark_puppet_bullets(self, before);
+    }
     puppet_place(self); /* the game's step moved it; the friend's position wins */
 }
 static void arrow(void *,double,double,double,double,double,int);
@@ -485,6 +492,8 @@ static void network_frame(void *self)
         s.vm = read_field(self, V_vm);
         s.mx = read_field(self, V_mx);
         s.my = read_field(self, V_my);
+        s.ix = pushX;
+        s.iy = pushY;
         s.flags = read_field(self, V_weave) != 0 ? SPIDER_WEAVING : 0;
         s.wx = read_field(player, V_ox);
         s.wy = read_field(player, V_oy);
@@ -543,6 +552,8 @@ static void network_frame(void *self)
 #include "markers.inc"
 
 #include "interact.inc"
+
+#include "webs.inc"
 /* Webbed pauses itself when its window loses focus (os_is_paused in oIO). During a session that
    would freeze one player whenever they look at a chat, and on one PC it pauses the second
    window outright; Esc still pauses. The call goes through a function slot we can wrap. */
@@ -653,6 +664,8 @@ __declspec(dllexport) double webbed_coop_init(void)
         log_line("coop: focus pause hook unavailable");
     if (!install_interaction_hooks())
         log_line("coop: spider interaction unavailable");
+    if (!install_web_hooks())
+        log_line("coop: web hooks unavailable");
     open_world_map();
     bus->magic = 0x57425032;
     GetModuleFileNameW(NULL, runtimeDir, MAX_PATH);

@@ -24,7 +24,7 @@ from pathlib import Path
 PORT = 37942
 PORTHOLE_APP = 4963920
 INVITE = re.compile(r"WB3/([A-Za-z0-9]{4,32})/([A-Za-z0-9_-]{20,24})\Z")
-SPIDER = struct.Struct("<5I8f12I2fI")
+SPIDER = struct.Struct("<5I8f12I2fI2d")
 HEAD = struct.Struct("<9I192s192s64s")
 LIMIT = 24 * 1024 * 1024
 ARRAYS = (
@@ -81,7 +81,9 @@ WORLD_SIZE = BODY_START + 768 * BODY.size
 TIES_HEADER = struct.Struct("<2I")
 TIE_MAX = 96
 CUT_RING = 64
-CUTS = struct.Struct(f"<I{CUT_RING}iI{CUT_RING}i")
+CUT = struct.Struct("<2i2f")  # id, kind (0 remove, 1 split), x, y
+CUTS_IN = 4 + CUT_RING * CUT.size
+CUTS_SIZE = CUTS_IN + 4 + CUT_RING * CUT.size
 TIES_SIZE = TIES_HEADER.size + TIE_MAX * STRAND.size
 
 
@@ -97,7 +99,7 @@ class Game:
         # Webs the guest tied to the host's spider (world.inc, "Ties").
         self.tiesmem = mmap.mmap(-1, TIES_SIZE, tagname=f"Local\\WebbedTies_{pid}")
         # Strands cut here that the other side owns, and the other way round (world.inc, "Cuts").
-        self.cutsmem = mmap.mmap(-1, CUTS.size, tagname=f"Local\\WebbedCuts_{pid}")
+        self.cutsmem = mmap.mmap(-1, CUTS_SIZE, tagname=f"Local\\WebbedCuts_{pid}")
         self.cuts_sent = struct.unpack_from("<I", self.cutsmem, 0)[0]
         self.lock = asyncio.Lock()
         self.serial = self.word(3) >> 8
@@ -254,21 +256,24 @@ class Game:
         count = struct.unpack_from("<I", self.cutsmem, 0)[0]
         if count - self.cuts_sent > CUT_RING:
             self.cuts_sent = count - CUT_RING
-        ids = []
+        out = b""
         while self.cuts_sent != count:
-            ids.append(struct.unpack_from("<i", self.cutsmem, 4 + 4 * (self.cuts_sent % CUT_RING))[0])
+            at = 4 + CUT.size * (self.cuts_sent % CUT_RING)
+            out += self.cutsmem[at : at + CUT.size]
             self.cuts_sent = (self.cuts_sent + 1) & 0xFFFFFFFF
-        return ids
+        return out
 
     def install_cuts(self, data):
-        if len(data) % 4 or len(data) > 4 * CUT_RING:
+        if len(data) % CUT.size or len(data) > CUT.size * CUT_RING:
             raise ValueError("Пакет разрезов")
-        base = 4 + 4 * CUT_RING
-        count = struct.unpack_from("<I", self.cutsmem, base)[0]
-        for (i,) in struct.iter_unpack("<i", data):
-            struct.pack_into("<i", self.cutsmem, base + 4 + 4 * (count % CUT_RING), i)
+        count = struct.unpack_from("<I", self.cutsmem, CUTS_IN)[0]
+        for i, kind, x, y in CUT.iter_unpack(data):
+            if kind not in (0, 1) or not (math.isfinite(x) and math.isfinite(y)):
+                raise ValueError("Пакет разрезов")
+            at = CUTS_IN + 4 + CUT.size * (count % CUT_RING)
+            CUT.pack_into(self.cutsmem, at, i, kind, x, y)
             count = (count + 1) & 0xFFFFFFFF
-        struct.pack_into("<I", self.cutsmem, base, count)
+        struct.pack_into("<I", self.cutsmem, CUTS_IN, count)
 
     def remote(self, data):
         if len(data) != SPIDER.size:
@@ -280,6 +285,7 @@ class Game:
             or v[4] > 63
             or any(not math.isfinite(x) or abs(x) > 1e7 for x in (*v[5:13], *v[25:27]))
             or v[27] > 1
+            or any(not math.isfinite(x) or abs(x) > 1e12 for x in v[28:30])
         ):
             raise ValueError("Недопустимое состояние паука")
         a = HEAD.size + SPIDER.size
@@ -630,7 +636,7 @@ class Play:
                 last_ties, raw = ties
                 await self.w.send(b"T", zlib.compress(raw, 1))
             if cuts := self.g.new_cuts():
-                await self.w.send(b"X", struct.pack(f"<{len(cuts)}i", *cuts))
+                await self.w.send(b"X", cuts)
             data = self.g.frame()
             if data and data != last:
                 await self.w.send(b"P", data)
@@ -934,6 +940,10 @@ def need_porthole():
 
 
 async def link(pid, profile=None):
+    # Windows wakes timers every 15.6 ms by default: a 1/60 s sleep would take one or two of
+    # those and the friend's frames would leave late and unevenly. 1 ms while we run.
+    with suppress(OSError, AttributeError):
+        ctypes.windll.winmm.timeBeginPeriod(1)
     game = Game(pid, profile)
     host = game.word(1) == 1
     # A read-only process handle ties the helper lifetime to its own game instance.

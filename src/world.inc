@@ -138,6 +138,7 @@ static void publish_world(void *self)
 typedef struct
 {
     int host, local;
+    int oid, aid; /* web bindings: the owner's endpoint ids last applied */
 } Binding;
 static Binding nodeBindings[WEB_MAX * 2], webBindings[WEB_MAX];
 static int nodeCount, webCount;
@@ -170,7 +171,50 @@ static int table_get(const Table *t, int key, int missing)
             return t->val[h];
     return missing;
 }
-static Table localById, bindingByHost, incomingIds;
+static Table localById, bindingByHost, incomingIds, nodeByHost, nodeDone;
+/* Physics bodies the other game owns (web nodes, loose objects) follow it through their speed:
+   each update aims them at the owner's position over the next few frames, and only a body that is
+   far off is put there outright. Local physics keeps running in between, so nothing stutters. */
+static void steer_body(void *p, double x, double y, double vx, double vy)
+{
+    double lx = coord(p, B_x), ly = coord(p, B_y), d = hypot(x - lx, y - ly);
+    if (!isfinite(d))
+        return;
+    if (d > 32)
+    {
+        set_coord(p, B_phy_position_x, x);
+        set_coord(p, B_phy_position_y, y);
+        set_coord(p, B_phy_speed_x, vx);
+        set_coord(p, B_phy_speed_y, vy);
+        return;
+    }
+    if (d < .25 && hypot(vx - coord(p, B_phy_speed_x), vy - coord(p, B_phy_speed_y)) < .05)
+        return;
+    set_coord(p, B_phy_speed_x, vx + (x - lx) / 5);
+    set_coord(p, B_phy_speed_y, vy + (y - ly) / 5);
+}
+static void node_table(void)
+{
+    table_clear(&nodeByHost);
+    table_clear(&nodeDone);
+    for (int i = 0; i < nodeCount; i++)
+        table_put(&nodeByHost, nodeBindings[i].host, nodeBindings[i].local);
+}
+/* A strand's end on a web node: that node is the owner's. */
+static void steer_endpoint(void *self, const Endpoint *e)
+{
+    if (e->type != 101 && e->type != 105)
+        return;
+    int local = table_get(&nodeByHost, e->id, -1);
+    if (local < 100000 && e->id <= LAST_PLACED_ID)
+        local = e->id;
+    if (local < 100000 || table_get(&nodeDone, local, 0))
+        return;
+    table_put(&nodeDone, local, 1);
+    void *p = find_id(self, local);
+    if (p && object_type(p) == e->type)
+        steer_body(p, e->x, e->y, 0, 0);
+}
 static void bind_id(Binding *list, int *n, int limit, int host, int local)
 {
     for (int i = 0; i < *n; i++)
@@ -180,7 +224,7 @@ static void bind_id(Binding *list, int *n, int limit, int host, int local)
             return;
         }
     if (*n < limit)
-        list[(*n)++] = (Binding){host, local};
+        list[(*n)++] = (Binding){host, local, 0, 0};
 }
 static int bound(Binding *list, int n, int host)
 {
@@ -255,6 +299,7 @@ static Ties incomingTies;
 static HANDLE tiesMapping;
 static int tieIds[TIE_MAX], tieIdCount; /* guest: the webs it sent; host: webs made from them */
 static int tieSource[TIE_MAX];          /* host: the guest's strand id for each */
+static int tieO[TIE_MAX], tieA[TIE_MAX]; /* host: the guest's endpoint ids last applied */
 static unsigned lastTies, tieRoom = ~0u;
 static int ownIds[OWN_MAX], ownCount; /* guest: webs its own spider spun */
 static int is_own(int id)
@@ -278,12 +323,14 @@ static int bound_local(int id)
             return 1;
     return 0;
 }
-/* Instance ids only grow, so a web newer than the newest one before the spider's step was spun
-   (or split off by a cut) during that step. */
+/* The guest owns every web made in its game, except those the sync itself creates from the host's
+   world: instance ids only grow, so whatever is newer than the newest web at the end of the last
+   sync was spun, split or snapped here since. A new room starts afresh: its own webs are the
+   room's, matched against the host's. */
+static int lastNewest = -1;
+static unsigned claimRoom = ~0u;
 static int newest_web(void *self)
 {
-    if (bus->role != GUEST || bus->status != CONNECTED)
-        return -1;
     int newest = 0;
     Iterator it;
     void *p;
@@ -307,17 +354,24 @@ static void forget_dead_own(void *self)
     }
     ownCount = n;
 }
-static void claim_new_webs(void *self, int newest)
+static void claim_new_webs(void *self)
 {
-    if (newest < 0)
+    if (bus->role != GUEST)
         return;
+    if (claimRoom != bus->room || lastNewest < 0)
+    {
+        claimRoom = bus->room;
+        ownCount = 0;
+        lastNewest = newest_web(self);
+        return;
+    }
     Iterator it;
     void *p;
     begin(&it, self, 107);
     while ((p = next(&it)))
     {
         int id = instance_id(p);
-        if (id <= newest || is_own(id))
+        if (id <= lastNewest || is_own(id))
             continue;
         if (ownCount == OWN_MAX)
             forget_dead_own(self);
@@ -325,15 +379,32 @@ static void claim_new_webs(void *self, int newest)
             ownIds[ownCount++] = id;
     }
 }
+/* Whose game decides about this web: the host's world, or the guest's own. */
+static int owned_here(int id)
+{
+    if (bus->role == HOST)
+        return !is_tie_web(id);
+    return !bound_local(id);
+}
 /* ---- Cuts: strand ids for the other side to remove. The game appends to "out", the network
    helper to "in"; each side only ever moves its own counter forward. ---- */
 #define CUT_RING 64
 typedef struct
 {
+    int32_t id, kind; /* CUT_REMOVE, or CUT_SPLIT at (x, y) with the game's own split_web */
+    float x, y;
+} Cut;
+enum
+{
+    CUT_REMOVE,
+    CUT_SPLIT
+};
+typedef struct
+{
     uint32_t outCount;
-    int32_t out[CUT_RING];
+    Cut out[CUT_RING];
     uint32_t inCount;
-    int32_t in[CUT_RING];
+    Cut in[CUT_RING];
 } Cuts;
 static Cuts *cutsData;
 static HANDLE cutsMapping;
@@ -344,14 +415,33 @@ typedef struct
     DWORD until;
 } Hold;
 static Hold holds[64];
-static void send_cut(int id)
+static void send_cut_ex(int id, int kind, double x, double y)
 {
     if (!cutsData)
         return;
-    cutsData->out[cutsData->outCount % CUT_RING] = id;
+    cutsData->out[cutsData->outCount % CUT_RING] = (Cut){id, kind, (float)x, (float)y};
     MemoryBarrier();
     cutsData->outCount++;
 }
+static void send_cut(int id)
+{
+    send_cut_ex(id, CUT_REMOVE, 0, 0);
+}
+/* A shot here hit a strand the friend owns: they split it at that point. */
+static void request_split(int id, double x, double y)
+{
+    if (bus->role == HOST)
+    {
+        for (int j = 0; j < tieIdCount; j++)
+            if (tieIds[j] == id)
+                send_cut_ex(tieSource[j], CUT_SPLIT, x, y);
+        return;
+    }
+    for (int i = 0; i < webCount; i++)
+        if (webBindings[i].local == id)
+            send_cut_ex(webBindings[i].host, CUT_SPLIT, x, y);
+}
+static void split_here(void *self, int id, double x, double y);
 /* A strand just cut here stays cut while the owner hears about it (a round trip or two). */
 static void hold(int id)
 {
@@ -380,16 +470,33 @@ static void receive_cuts(void *self)
         cutsSeen = count - CUT_RING;
     for (; cutsSeen != count; cutsSeen++)
     {
-        int id = cutsData->in[cutsSeen % CUT_RING];
-        void *p = find_id(self, id);
-        if (!p || object_type(p) != 107)
+        Cut c = cutsData->in[cutsSeen % CUT_RING];
+        void *p = find_id(self, c.id);
+        /* Only the owner's copy changes: the guest's own webs, or the host's world. */
+        if (!p || object_type(p) != 107 || !owned_here(c.id) || !value(FN(self, instance_exists, num(c.id))))
             continue;
-        /* Only the owner's copy goes: the guest removes what it spun, the host what its world has. */
-        if (bus->role == GUEST ? !is_tie_web(id) : is_tie_web(id))
+        if (c.kind == CUT_SPLIT)
+        {
+            if (isfinite(c.x) && isfinite(c.y))
+                split_here(self, c.id, c.x, c.y);
             continue;
-        hold(id);
+        }
+        hold(c.id);
         FN0(p, instance_destroy);
     }
+}
+/* The owner moved a strand's ends (a split ties its first half to a new node): do the same here. */
+static void reattach(void *self, void *p, Strand *s)
+{
+    int o = resolve_anchor(self, s->o), a = resolve_anchor(self, s->a);
+    if ((s->o.type >= 0 && o < 0) || (s->a.type >= 0 && a < 0))
+        return;
+    *field(p, V_o) = num(o);
+    *field(p, V_a) = num(a);
+    for (int j = 0; j < 12; j++)
+        *field(p, webFields[j]) = num(s->props[j]);
+    Val id = num(instance_id(p));
+    script(p, 0x4df040, 1, &id);
 }
 static void publish_ties(void *self)
 {
@@ -408,9 +515,9 @@ static void publish_ties(void *self)
     while ((p = next(&it)) && tiesData->count < TIE_MAX)
     {
         int id = instance_id(p);
-        /* Ours: what our spider spun, and webs on the friend's spider that are not from the host. */
+        /* Ours: what our game made, and webs on the friend's spider that are not from the host. */
         if (!is_own(id) &&
-            ((value(*field(p, V_o)) != rid && value(*field(p, V_a)) != rid) || (!is_tie_web(id) && bound_local(id))))
+            ((value(*field(p, V_o)) != rid && value(*field(p, V_a)) != rid) || bound_local(id)))
             continue;
         fresh[freshCount++] = id;
         fill_strand(self, p, &tiesData->s[tiesData->count++]);
@@ -448,7 +555,8 @@ static void apply_ties(void *self)
     if (seq != tiesData->version || incomingTies.count > TIE_MAX)
         return;
     lastTies = seq;
-    int keepIds[TIE_MAX], keepSource[TIE_MAX], keep = 0;
+    node_table();
+    int keepIds[TIE_MAX], keepSource[TIE_MAX], keepO[TIE_MAX], keepA[TIE_MAX], keep = 0;
     for (unsigned i = 0; i < incomingTies.count; i++)
     {
         Strand *s = &incomingTies.s[i];
@@ -482,9 +590,21 @@ static void apply_ties(void *self)
             script(p, 0x4df040, 1, &created);
         }
         else
-            *field(p, V_length) = num(s->props[8]);
+        {
+            int j = 0;
+            while (j < tieIdCount && tieIds[j] != instance_id(p))
+                j++;
+            if (j < tieIdCount && (tieO[j] != s->o.id || tieA[j] != s->a.id))
+                reattach(self, p, s);
+            else
+                *field(p, V_length) = num(s->props[8]);
+            steer_endpoint(self, &s->o);
+            steer_endpoint(self, &s->a);
+        }
         if (keep < TIE_MAX)
         {
+            keepO[keep] = s->o.id;
+            keepA[keep] = s->a.id;
             keepIds[keep] = instance_id(p);
             keepSource[keep++] = s->id;
         }
@@ -501,6 +621,8 @@ static void apply_ties(void *self)
     }
     memcpy(tieIds, keepIds, keep * sizeof(int));
     memcpy(tieSource, keepSource, keep * sizeof(int));
+    memcpy(tieO, keepO, keep * sizeof(int));
+    memcpy(tieA, keepA, keep * sizeof(int));
     tieIdCount = keep;
 }
 typedef struct
@@ -558,14 +680,17 @@ static void apply_world(void *self)
     for (int j = 0; j < n; j++)
         table_put(&localById, localWebs[j].id, j);
     for (int j = 0; j < webCount; j++)
-        table_put(&bindingByHost, webBindings[j].host, webBindings[j].local);
+        table_put(&bindingByHost, webBindings[j].host, j);
+    node_table();
     for (unsigned i = 0; i < w->numWebs; i++)
     {
         Strand *s = &w->web[i];
         if (held(s->id))
             continue;
-        int target = table_get(&bindingByHost, s->id, -4);
+        int bindex = table_get(&bindingByHost, s->id, -1);
+        int target = bindex >= 0 ? webBindings[bindex].local : -4;
         int match = target >= 100000 ? table_get(&localById, target, -1) : -1;
+        int moved = bindex >= 0 && (webBindings[bindex].oid != s->o.id || webBindings[bindex].aid != s->a.id);
         if (match >= 0 && localWebs[match].used)
             match = -1;
         if (match < 0)
@@ -612,15 +737,17 @@ static void apply_world(void *self)
             for (int j = 0; j < 12; j++)
                 *field(p, webFields[j]) = num(s->props[j]);
         }
+        else if (moved)
+            reattach(self, p, s);
         else
-        {
             *field(p, V_length) = num(s->props[8]);
-        }
+        steer_endpoint(self, &s->o);
+        steer_endpoint(self, &s->a);
         set_coord(p, B_image_blend, s->colour);
         Val id = num(instance_id(p));
         if (match < 0)
             script(p, 0x4df040, 1, &id);
-        fresh[count++] = (Binding){s->id, (int)value(id)};
+        fresh[count++] = (Binding){s->id, (int)value(id), s->o.id, s->a.id};
     }
     if (w->complete)
     {
@@ -641,6 +768,16 @@ static void apply_world(void *self)
                     FN0(p, instance_destroy);
             }
         }
+    /* The host's world is the authority: a web here that is neither ours nor one of the host's is
+       left over (an old copy, a stray piece) and would show twice. */
+    if (w->complete)
+        for (int j = 0; j < n; j++)
+            if (!localWebs[j].used && !is_tie_web(localWebs[j].id))
+            {
+                p = find_id(self, localWebs[j].id);
+                if (p && object_type(p) == 107)
+                    FN0(p, instance_destroy);
+            }
     memcpy(webBindings, fresh, count * sizeof(Binding));
     webCount = count;
     for (unsigned i = 0; i < w->numBodies; i++)
@@ -652,26 +789,28 @@ static void apply_world(void *self)
         p = find_id(self, b->id);
         if (!p || object_type(p) != b->type || !mobile_type(b->type))
             continue;
-        if (hypot(coord(p, B_x) - b->x, coord(p, B_y) - b->y) > .75 || fabs(coord(p, B_phy_rotation) - b->angle) > 2)
-        {
-            set_coord(p, B_phy_position_x, b->x);
-            set_coord(p, B_phy_position_y, b->y);
-            set_coord(p, B_phy_rotation, b->angle);
-            set_coord(p, B_phy_speed_x, b->vx);
-            set_coord(p, B_phy_speed_y, b->vy);
-            set_coord(p, B_phy_angular_velocity, b->spin);
-        }
+        steer_body(p, b->x, b->y, b->vx, b->vy);
+        double turn = b->angle - coord(p, B_phy_rotation);
+        if (fabs(turn) > 45)
+            set_coord(p, B_phy_rotation, b->angle), set_coord(p, B_phy_angular_velocity, b->spin);
+        else if (fabs(turn) > .5 || fabs(b->spin - coord(p, B_phy_angular_velocity)) > .5)
+            set_coord(p, B_phy_angular_velocity, b->spin + turn / 5);
     }
 }
 static void sync_world(void *self)
 {
     if (bus->role)
         receive_cuts(self);
+    if (bus->role == GUEST && bus->status == CONNECTED)
+        claim_new_webs(self);
     if (!worldData || !same_room() || !remote)
     {
         knownRoom = ~0u;
-        if (bus->role == HOST)
-            tieIdCount = 0; /* the guest left: what it spun here stays as part of the room */
+        /* The guest went to another room or left the session: what it spun here stays as part of
+           the room. A moment without frames (a hitch, loading) changes nothing. */
+        if (bus->role == HOST &&
+            (bus->status != CONNECTED || (incoming.active && incoming.room != bus->room)))
+            tieIdCount = 0;
         return;
     }
     /* Pausing deactivates every instance: a world read now would have no webs, and one applied now
@@ -683,6 +822,7 @@ static void sync_world(void *self)
     if (bus->role == GUEST)
     {
         apply_world(self);
+        lastNewest = newest_web(self);
         if (menuTick % 4 == 2)
             publish_ties(self);
     }

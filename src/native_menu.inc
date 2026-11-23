@@ -539,19 +539,19 @@ static void soft_pause_step(void *self, int subWasOpen)
    with a jump to `hook`; *original gets a trampoline that runs those bytes and jumps back. */
 /* Jumps from `va` to `hook`. If `original` is given, it gets a trampoline that runs the 5 bytes
    overwritten (they must be whole instructions with no relative operands) and jumps back. */
-static int hook_code(uintptr_t va, const unsigned char *prologue, void *hook, void **original)
+static int hook_code_n(uintptr_t va, const unsigned char *prologue, int n, void *hook, void **original)
 {
     unsigned char *code = addr(va);
-    if (memcmp(code, prologue, 5))
+    if (n < 5 || n > 16 || memcmp(code, prologue, n))
         return 0;
     if (original)
     {
-        unsigned char *tramp = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        unsigned char *tramp = VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (!tramp)
             return 0;
-        memcpy(tramp, prologue, 5);
-        tramp[5] = 0xe9;
-        *(int32_t *)(tramp + 6) = (int32_t)((uintptr_t)(code + 5) - (uintptr_t)(tramp + 10));
+        memcpy(tramp, prologue, n);
+        tramp[n] = 0xe9;
+        *(int32_t *)(tramp + n + 1) = (int32_t)((uintptr_t)(code + n) - (uintptr_t)(tramp + n + 5));
         FlushInstructionCache(GetCurrentProcess(), tramp, 16);
         *original = tramp;
     }
@@ -563,6 +563,10 @@ static int hook_code(uintptr_t va, const unsigned char *prologue, void *hook, vo
     VirtualProtect(code, 5, old, &old);
     FlushInstructionCache(GetCurrentProcess(), code, 5);
     return 1;
+}
+static int hook_code(uintptr_t va, const unsigned char *prologue, void *hook, void **original)
+{
+    return hook_code_n(va, prologue, 5, hook, original);
 }
 static int hook_script(uintptr_t va, void *hook, Script *original)
 {

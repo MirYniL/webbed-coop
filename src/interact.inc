@@ -205,55 +205,6 @@ static int install_interaction_hooks(void)
     return ok;
 }
 
-/* ---- A web tied to this player's spider holds it like a rope, the way webs hold bugs and NPCs:
-   the spider cannot get further from the other end than the web is long. Spiders are not physics
-   bodies, so the web's own force never reaches them; this does it. Such a web does not snap by
-   itself (the friend's position is always a little off); shooting it still cuts it. ---- */
-static void rope_pull(void *self)
-{
-    if (!player || !bus || bus->status != CONNECTED)
-        return;
-    double me = coord(player, B_id), fr = remote ? coord(remote, B_id) : -1;
-    double px = coord(player, B_x), py = coord(player, B_y);
-    double vx = coord(player, B_phy_speed_x), vy = coord(player, B_phy_speed_y);
-    double moveX = 0, moveY = 0;
-    int held = 0;
-    Iterator it;
-    void *web;
-    begin(&it, self, 107);
-    while ((web = next(&it)))
-    {
-        double o = value(*field(web, V_o)), a = value(*field(web, V_a));
-        if (o == me || a == me || o == fr || a == fr)
-            *field(web, V_breakable) = num(0);
-        int isO = o == me, isA = a == me;
-        if (!isO && !isA)
-            continue;
-        double tx = read_field(web, isO ? V_ax : V_ox), ty = read_field(web, isO ? V_ay : V_oy);
-        double length = read_field(web, V_length), dist = hypot(tx - px, ty - py);
-        if (length <= 0 || dist <= length)
-            continue;
-        double nx = (tx - px) / dist, ny = (ty - py) / dist, over = dist - length;
-        moveX += nx * fmin(over, 6);
-        moveY += ny * fmin(over, 6);
-        /* Drop the part of the velocity that stretches the web further. */
-        double outward = -(vx * nx + vy * ny);
-        if (outward > 0)
-        {
-            vx += nx * outward;
-            vy += ny * outward;
-        }
-        held = 1;
-    }
-    if (held)
-    {
-        set_coord(player, B_phy_position_x, px + moveX);
-        set_coord(player, B_phy_position_y, py + moveY);
-        set_coord(player, B_phy_speed_x, vx);
-        set_coord(player, B_phy_speed_y, vy);
-    }
-}
-
 /* ---- Hugs and dancing together: small pixel hearts in the game's palette. ---- */
 typedef struct
 {
@@ -334,43 +285,9 @@ static void draw_hearts(void *self)
     }
     FN(self, draw_set_alpha, alpha);
 }
-/* ---- Bodies. The raycasts above let this player's spider stand on the friend and bump into
-   them; this covers the rest. When the friend walks into us we are pushed aside a little at a time
-   (as spiders shove bugs), and when we stand on the friend's back we ride along with them. ---- */
-static double riderLastX, riderLastY;
-static int riderValid;
-static void body_contact(void)
-{
-    if (!player || !remote || !same_room() || incoming.active != SPIDER_PLAYING)
-    {
-        riderValid = 0;
-        return;
-    }
-    double px = coord(player, B_x), py = coord(player, B_y), fx = coord(remote, B_x), fy = coord(remote, B_y);
-    double dx = px - fx, dy = py - fy, d = hypot(dx, dy), nx = px, ny = py;
-    if (d < 13 && d > .01)
-    {
-        double k = fmin(13 - d, 1.5) / d;
-        nx += dx * k;
-        ny += dy * k;
-    }
-    /* On the friend's back: their step carries us. */
-    if (riderValid && dy < -6 && dy > -18 && fabs(dx) < 10)
-    {
-        double mx = fx - riderLastX, my = fy - riderLastY;
-        if (hypot(mx, my) < 12)
-            nx += mx, ny += my;
-    }
-    riderLastX = fx, riderLastY = fy, riderValid = 1;
-    if (nx != px || ny != py)
-    {
-        set_coord(player, B_phy_position_x, nx);
-        set_coord(player, B_phy_position_y, ny);
-    }
-}
+static void webs_step(void *self);
 static void interaction_step(void *self)
 {
-    body_contact();
-    rope_pull(self);
+    webs_step(self);
     hearts_step(self);
 }
