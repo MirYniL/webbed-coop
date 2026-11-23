@@ -696,7 +696,8 @@ static void apply_world(void *self)
         if (match < 0)
         {
             /* A strand seen for the first time: pair it with a local web at the same place, if any. */
-            double minCost = 100;
+            /* Only a web at the same place: a short strand must not take a neighbour. */
+            double minCost = 16;
             for (int j = 0; j < n; j++)
             {
                 LocalWeb *l = &localWebs[j];
@@ -817,13 +818,13 @@ static void sync_world(void *self)
        would duplicate webs that are only switched off. Wait for both games to be running. */
     if (localPaused || incoming.active == SPIDER_PAUSED)
         return;
-    if (bus->role == HOST && menuTick % 4 == 0)
+    if (bus->role == HOST && menuTick % 2 == 0)
         publish_world(self);
     if (bus->role == GUEST)
     {
         apply_world(self);
         lastNewest = newest_web(self);
-        if (menuTick % 4 == 2)
+        if (menuTick % 2 == 1)
             publish_ties(self);
     }
     else

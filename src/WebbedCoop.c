@@ -312,11 +312,11 @@ static void remote_event(Event orig, void *self, void *other)
     for (unsigned i = 0; i < sizeof(ids) / sizeof(*ids); i++)
         *field(io, ids[i]) = old[i];
 }
-/* Snapshot interpolation: the puppet is drawn 60 ms behind the friend's latest frame, between
+/* Snapshot interpolation: the puppet is drawn 40 ms behind the friend's latest frame, between
    the two frames around that moment, so it moves at the game's own frame rate however the
    frames arrive. */
 #define SNAP_COUNT 32
-#define SNAP_DELAY 60
+#define SNAP_DELAY 40
 typedef struct
 {
     DWORD t;
