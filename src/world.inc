@@ -91,6 +91,7 @@ static int mobile_type(int t)
     return 0;
 }
 static int is_tie_web(int id);
+static int provisional(int id);
 static void fill_strand(void *self, void *p, Strand *s);
 static void publish_world(void *self)
 {
@@ -110,7 +111,7 @@ static void publish_world(void *self)
             worldData->complete = 0;
             break;
         }
-        if (is_tie_web(instance_id(p)))
+        if (is_tie_web(instance_id(p)) || provisional(instance_id(p)))
             continue;
         Strand *s = &worldData->web[worldData->numWebs++];
         s->id = instance_id(p);
@@ -371,13 +372,66 @@ static void claim_new_webs(void *self)
     while ((p = next(&it)))
     {
         int id = instance_id(p);
-        if (id <= lastNewest || is_own(id))
+        if (id <= lastNewest || is_own(id) || provisional(id))
             continue;
         if (ownCount == OWN_MAX)
             forget_dead_own(self);
         if (ownCount < OWN_MAX)
             ownIds[ownCount++] = id;
     }
+}
+/* Stand-ins: when we cut the friend's strand, our copy is split at once with the game's code and
+   the owner splits theirs. The strand's own copy (keep) is left alone until the owner's change
+   arrives; the new pieces wait for the owner's pieces to take their place, or go after a while. */
+typedef struct
+{
+    int id, keep;
+    DWORD until;
+} Provisional;
+static Provisional provs[48];
+static void mark_provisional(int id, int keep)
+{
+    DWORD now = GetTickCount();
+    int slot = 0;
+    for (int i = 0; i < 48; i++)
+        if ((int)(provs[i].until - now) < (int)(provs[slot].until - now))
+            slot = i;
+    provs[slot] = (Provisional){id, keep, now + 1500};
+}
+static int provisional(int id)
+{
+    DWORD now = GetTickCount();
+    for (int i = 0; i < 48; i++)
+        if (provs[i].id == id && (int)(provs[i].until - now) > 0)
+            return 1;
+    return 0;
+}
+static void unprovision(int id)
+{
+    for (int i = 0; i < 48; i++)
+        if (provs[i].id == id)
+            provs[i].id = 0;
+}
+static void mark_new_provisional(void *self, int before)
+{
+    Iterator it;
+    void *p;
+    begin(&it, self, 107);
+    while ((p = next(&it)))
+        if (instance_id(p) > before)
+            mark_provisional(instance_id(p), 0);
+}
+static void expire_provisional(void *self)
+{
+    DWORD now = GetTickCount();
+    for (int i = 0; i < 48; i++)
+        if (provs[i].id && (int)(provs[i].until - now) <= 0)
+        {
+            void *p = provs[i].keep ? NULL : find_id(self, provs[i].id);
+            if (p && object_type(p) == 107)
+                FN0(p, instance_destroy);
+            provs[i].id = 0;
+        }
 }
 /* Whose game decides about this web: the host's world, or the guest's own. */
 static int owned_here(int id)
@@ -573,6 +627,24 @@ static void apply_ties(void *self)
             }
         if (!p)
         {
+            Iterator pit;
+            void *q;
+            begin(&pit, self, 107);
+            while ((q = next(&pit)))
+                if (provisional(instance_id(q)) &&
+                    fabs(read_field(q, V_ox) - s->props[0]) + fabs(read_field(q, V_oy) - s->props[1]) +
+                            fabs(read_field(q, V_ax) - s->props[2]) + fabs(read_field(q, V_ay) - s->props[3]) <
+                        16)
+                {
+                    p = q;
+                    unprovision(instance_id(q));
+                    reattach(self, p, s);
+                    set_coord(p, B_image_blend, s->colour);
+                    break;
+                }
+        }
+        if (!p)
+        {
             int o = resolve_anchor(self, s->o), a = resolve_anchor(self, s->a);
             if ((s->o.type >= 0 && o < 0) || (s->a.type >= 0 && a < 0))
                 continue;
@@ -596,7 +668,7 @@ static void apply_ties(void *self)
                 j++;
             if (j < tieIdCount && (tieO[j] != s->o.id || tieA[j] != s->a.id))
                 reattach(self, p, s);
-            else
+            else if (!provisional(instance_id(p)))
                 *field(p, V_length) = num(s->props[8]);
             steer_endpoint(self, &s->o);
             steer_endpoint(self, &s->a);
@@ -715,6 +787,8 @@ static void apply_world(void *self)
         if (match >= 0)
         {
             localWebs[match].used = 1;
+            if (target != localWebs[match].id)
+                unprovision(localWebs[match].id);
             p = find_id(self, localWebs[match].id);
         }
         else
@@ -740,7 +814,7 @@ static void apply_world(void *self)
         }
         else if (moved)
             reattach(self, p, s);
-        else
+        else if (!provisional(instance_id(p)))
             *field(p, V_length) = num(s->props[8]);
         steer_endpoint(self, &s->o);
         steer_endpoint(self, &s->a);
@@ -773,7 +847,7 @@ static void apply_world(void *self)
        left over (an old copy, a stray piece) and would show twice. */
     if (w->complete)
         for (int j = 0; j < n; j++)
-            if (!localWebs[j].used && !is_tie_web(localWebs[j].id))
+            if (!localWebs[j].used && !is_tie_web(localWebs[j].id) && !provisional(localWebs[j].id))
             {
                 p = find_id(self, localWebs[j].id);
                 if (p && object_type(p) == 107)
@@ -800,6 +874,7 @@ static void apply_world(void *self)
 }
 static void sync_world(void *self)
 {
+    expire_provisional(self);
     if (bus->role)
         receive_cuts(self);
     if (bus->role == GUEST && bus->status == CONNECTED)

@@ -133,8 +133,8 @@ static Val *coop_raycast(void *self, void *other, Val *ret, int argc, Val **argv
         double ax = value(*argv[0]), ay = value(*argv[1]), bx = value(*argv[2]), by = value(*argv[3]);
         double cx = coord(friendSpider, B_x), cy = coord(friendSpider, B_y);
         /* Feet and sides meet a flat box; aiming (long rays) the round body. */
-        double t = hypot(bx - ax, by - ay) < 48 ? segment_box(ax, ay, bx, by, cx, cy, SPIDER_RADIUS)
-                                                : segment_circle(ax, ay, bx, by, cx, cy, SPIDER_RADIUS);
+        /* Spiders pass through each other (feet and sides never meet the friend); aiming does. */
+        double t = hypot(bx - ax, by - ay) < 48 ? -1 : segment_circle(ax, ay, bx, by, cx, cy, SPIDER_RADIUS);
         if (t >= 0)
         {
             double hx = ax + (bx - ax) * t, hy = ay + (by - ay) * t, hitDist = hypot(hx - ax, hy - ay);

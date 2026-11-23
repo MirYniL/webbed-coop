@@ -242,9 +242,11 @@ static void on_step(void *self, void *other);
 static void remote_event(Event orig, void *self, void *other)
 {
     double dx = incoming.hm, dy = incoming.vm, px = coord(self, B_x), py = coord(self, B_y);
-    /* Jump, grapple, dance. The friend's shots are fired in the friend's game (what they hit there
-       reaches us as cuts and pushes), and interact on the host, whose world has the switches. */
-    unsigned keep = (1u << 0) | (1u << 1) | (1u << 4);
+    /* Jump and dance only animate the copy. Its grapple and shots stay in the friend's game: there
+       they make real webs (the grapple line is one), split and bisect strands, and all of that
+       reaches us through the sync. Run here too, they would cut and attach a second time. Interact
+       goes through on the host, whose world has the switches. */
+    unsigned keep = (1u << 0) | (1u << 4);
     if (bus->role == HOST)
         keep |= 1u << 5;
     unsigned b = incoming.buttons & keep, pr = remotePress & keep, rel = remoteRelease & keep;

@@ -112,9 +112,15 @@ static Val *coop_split(void *self, void *other, Val *ret, int argc, Val **argv)
         {
             Val px = FN(self, array_get, *argv[1], num(0)), py = FN(self, array_get, *argv[1], num(1));
             request_split(instance_id(web), value(px), value(py));
-            /* The owner's pieces arrive with the next sync. */
-            *ret = no_pieces(self);
-            return ret;
+            /* Cut our copy right away, as the owner will: the pieces here stand in until the owner's
+               own pieces arrive and take their place. */
+            int before = newest_web(self);
+            mark_provisional(instance_id(web), 1);
+            splitting = 1;
+            Val *r = splitOriginal(self, other, ret, argc, argv);
+            splitting = 0;
+            mark_new_provisional(self, before);
+            return r;
         }
     }
     return splitOriginal(self, other, ret, argc, argv);
@@ -202,6 +208,10 @@ static void receive_pushes(void)
     gotX = incoming.ix, gotY = incoming.iy;
     if (fabs(dx) + fabs(dy) < 1e-9 || fabs(dx) + fabs(dy) > 1e5)
         return;
+    /* A single huge push (both pulling at once, a late burst of frames) would fling the spider. */
+    double size = hypot(dx, dy);
+    if (size > 2)
+        dx *= 2 / size, dy *= 2 / size;
     Val r = undef(), args[] = {num(coord(player, B_x)), num(coord(player, B_y)), num(dx), num(dy)};
     impulseOriginal(&r, player, player, 4, args);
 }
@@ -252,50 +262,10 @@ static void webs_on_me(void *self)
     set_coord(player, B_phy_speed_y, vy * keep);
 }
 
-/* ---- Bodies. The raycasts let each spider stand on the friend and meet them as a wall; a friend
-   walking into us carries us along at their pace, and standing on their back we ride with them. */
-static double riderLastX, riderLastY;
-static int riderValid;
-static void bodies(void)
-{
-    if (!player || !remote || !same_room() || incoming.active != SPIDER_PLAYING)
-    {
-        riderValid = 0;
-        return;
-    }
-    double px = coord(player, B_x), py = coord(player, B_y), fx = coord(remote, B_x), fy = coord(remote, B_y);
-    double dx = px - fx, dy = py - fy, d = hypot(dx, dy);
-    double vx = coord(player, B_phy_speed_x);
-    double mx = riderValid ? fx - riderLastX : 0, my = riderValid ? fy - riderLastY : 0;
-    riderLastX = fx, riderLastY = fy, riderValid = 1;
-    if (hypot(mx, my) > 12)
-        return; /* the friend's position jumped (a door, a respawn), not a step */
-    if (dy < -10 && dy > -30 && fabs(dx) < 12)
-    {
-        /* On the friend's back. */
-        set_coord(player, B_phy_position_x, px + mx);
-        set_coord(player, B_phy_position_y, py + my);
-        return;
-    }
-    if (d < 24 && fabs(dy) < 12 && d > .01)
-    {
-        /* The friend is moving into us from the side: keep up with them. */
-        double side = dx > 0 ? 1 : -1;
-        if (mx * side > 0 && vx * side < mx * side)
-            set_coord(player, B_phy_speed_x, mx);
-    }
-    if (d < 10 && d > .01)
-    {
-        double k = (10 - d) / d * .3;
-        set_coord(player, B_phy_position_x, px + dx * k);
-        set_coord(player, B_phy_position_y, py + dy * k);
-    }
-}
 static void webs_step(void *self)
 {
     receive_pushes();
     webs_on_me(self);
-    bodies();
 }
 static int install_web_hooks(void)
 {
