@@ -111,10 +111,19 @@ static int webs_on(void *self, void *spider)
         n += value(*field(web, V_o)) == id || value(*field(web, V_a)) == id;
     return n;
 }
+/* The friend is something to aim at, never something to bump into: only while the grapple or the
+   weave is held, and only for long (aiming) rays. */
+static int aiming(void)
+{
+    return io && (read_field(io, V_grapple) != 0 || read_field(io, V_weave) != 0);
+}
 static Val *coop_raycast(void *self, void *other, Val *ret, int argc, Val **argv)
 {
     Val *r = raycastOriginal(self, other, ret, argc, argv);
-    void *friendSpider = other_spider(self);
+    void *friendSpider = aiming() ? other_spider(self) : NULL;
+    if (friendSpider && argc >= 4 &&
+        hypot(value(*argv[2]) - value(*argv[0]), value(*argv[3]) - value(*argv[1])) < 96)
+        friendSpider = NULL;
     if (friendSpider && argc >= 5 && solid_query(self, *argv[4]))
     {
         double ax = value(*argv[0]), ay = value(*argv[1]), bx = value(*argv[2]), by = value(*argv[3]);
@@ -125,8 +134,7 @@ static Val *coop_raycast(void *self, void *other, Val *ret, int argc, Val **argv
            friend lands the same on both screens. */
         /* A friend moves a little all the time, so a held weave would tie a strand to them on
            every frame: three strands on one spider is plenty. */
-        if (hypot(bx - ax, by - ay) >= 48 && webs_on(self, friendSpider) >= 3)
-            friendSpider = NULL;
+
     }
     if (friendSpider && argc >= 5 && solid_query(self, *argv[4]))
     {
@@ -186,12 +194,10 @@ static Builtin collisionCircleOriginal;
 static void coop_collision_circle(Val *ret, void *self, void *other, int argc, Val *args)
 {
     collisionCircleOriginal(ret, self, other, argc, args);
-    void *friendSpider = other_spider(self);
+    void *friendSpider = io && read_field(io, V_weave) != 0 ? other_spider(self) : NULL;
     if (!friendSpider || argc < 4 || value(*ret) >= 100000 || (int)value(args[3]) != OBJ_oSolid)
         return;
-    /* A held weave would otherwise tie a new strand every frame it touches the friend. */
-    if (webs_on(self, friendSpider) >= 3)
-        return;
+
     double d = hypot(coord(friendSpider, B_x) - value(args[0]), coord(friendSpider, B_y) - value(args[1]));
     if (d <= value(args[2]) + SPIDER_RADIUS)
         *ret = num(coord(friendSpider, B_id));

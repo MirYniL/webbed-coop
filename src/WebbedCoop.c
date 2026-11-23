@@ -230,6 +230,7 @@ static void on_clean(void *self, void *other)
 }
 static double pushX, pushY;
 static int puppetEvent;
+static int playerEvent; /* our own spider is running its step: its pushes on things are ours */
 static int newest_bullet(void *self);
 static void mark_puppet_bullets(void *self, int before); /* the friend's copy is running its own events: its own forces are not pushes */
 static int same_room(void)
@@ -249,7 +250,7 @@ static void remote_event(Event orig, void *self, void *other)
        they make real webs (the grapple line is one), split and bisect strands, and all of that
        reaches us through the sync. Run here too, they would cut and attach a second time. Interact
        goes through on the host, whose world has the switches. */
-    unsigned keep = (1u << 0) | (1u << 4);
+    unsigned keep = (1u << 0) | (1u << 3) | (1u << 4); /* jump, shots (for show), dance */
     if (bus->role == HOST)
         keep |= 1u << 5;
     unsigned b = incoming.buttons & keep, pr = remotePress & keep, rel = remoteRelease & keep;
@@ -387,7 +388,9 @@ static void on_step(void *self, void *other)
     }
     if (self != remote)
     {
+        playerEvent += self == player;
         stepPlayer(self, other);
+        playerEvent -= self == player;
         return;
     }
     if (!same_room())
@@ -648,7 +651,7 @@ __declspec(dllexport) double webbed_coop_init(void)
     {
         uintptr_t slot, original;
         Event newEvent, *old;
-    } binds[] = {{0x15dbd14,0xe20e80,on_main_menu_create,&createMainMenu},{0x15d9ba8,0x9baa10,on_book_draw,&drawBook},{0x15d9e0c, 0xa609e0, on_create, &createPlayer}, {0x15d9e54, 0xa68e10, on_step, &stepPlayer},
+    } binds[] = {{0x15dbd14,0xe20e80,on_main_menu_create,&createMainMenu},{0x15da0dc,0xb6f680,on_node_step,&stepNode},{0x15d9ba8,0x9baa10,on_book_draw,&drawBook},{0x15d9e0c, 0xa609e0, on_create, &createPlayer}, {0x15d9e54, 0xa68e10, on_step, &stepPlayer},
                  {0x15d9e90, 0xb070a0, on_draw, &drawPlayer},
                  {0x15d9e9c, 0xb07de0, on_draw_end, &drawEndPlayer},     {0x15d9ea8, 0xb141c0, on_clean, &cleanPlayer},
                  {0x15d98b4, 0x9532e0, on_input, &stepInput},     {0x15d9818, 0x913b20, on_camera, &stepCamera},

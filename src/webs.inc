@@ -25,9 +25,10 @@ static Val *coop_snap(void *self, void *other, Val *ret, int argc, Val **argv)
     if (bus && bus->status == CONNECTED && argc >= 1)
     {
         void *web = find_id(self, (int)value(*argv[0]));
-        /* A strand the friend owns snaps only in the friend's game (the pieces come with the sync),
-           or it would snap twice; ours snap by the game's own rules, on spiders as on bugs. */
-        if (web && object_type(web) == 107 && same_room() && !owned_here(instance_id(web)))
+        /* A strand on a spider does not snap by itself (the friend is always drawn a little late, so
+           it would stretch and break all the time); a shot still cuts it. One the friend owns snaps
+           only in the friend's game (the pieces come with the sync), or it would snap twice. */
+        if (web && object_type(web) == 107 && (on_spider(web) || (same_room() && !owned_here(instance_id(web)))))
         {
             *ret = no_pieces(self);
             return ret;
@@ -81,6 +82,10 @@ static int puppet_bullet(void *p)
             return 1;
     return 0;
 }
+static int own_bullet(void *p)
+{
+    return p && (object_type(p) == OBJ_oBullet || object_type(p) == OBJ_oBullet_collides_platforms) && !puppet_bullet(p);
+}
 /* What a split returns to the bullet: its two new pieces. None here (the bullet pushes them). */
 static Val no_pieces(void *self)
 {
@@ -110,16 +115,13 @@ static Val *coop_split(void *self, void *other, Val *ret, int argc, Val **argv)
         void *web = find_id(self, (int)value(*argv[0]));
         if (web && object_type(web) == 107 && !owned_here(instance_id(web)) && value(FN(self, is_array, *argv[1])))
         {
-            Val px = FN(self, array_get, *argv[1], num(0)), py = FN(self, array_get, *argv[1], num(1));
-            request_split(instance_id(web), value(px), value(py));
-            /* Cut our copy right away, as the owner will: the pieces here stand in until the owner's
-               own pieces arrive and take their place. */
-            int before = newest_web(self);
-            mark_provisional(instance_id(web), 1);
+            /* Whoever cuts a strand (a shot, a grapple landing on it) owns what is left of it: our game
+               splits it now with its own code and keeps both pieces, and the old owner only drops
+               the strand. Nothing waits on a round trip, so a grapple holds on the first shot. */
+            take_over(instance_id(web));
             splitting = 1;
             Val *r = splitOriginal(self, other, ret, argc, argv);
             splitting = 0;
-            mark_new_provisional(self, before);
             return r;
         }
     }
@@ -156,13 +158,15 @@ static double gotX, gotY; /* the friend's totals already applied here */
 static int gotValid;
 /* The friend's copy pulling our own spider (its grapple on us): the friend's game sends that pull
    itself, so it must not count twice. */
-static int puppet_on_player(void *self)
+static int puppet_bullet(void *p);
+static int puppet_on_player(void *self, void *other)
 {
-    return puppetEvent && self && self == player;
+    return self && self == player && (puppetEvent || puppet_bullet(other));
 }
+static void forward_push(void *self, void *other, double ix, double iy);
 static void coop_force(Val *ret, void *self, void *other, int argc, Val *args)
 {
-    if (puppet_on_player(self))
+    if (puppet_on_player(self, other))
     {
         *ret = undef();
         return;
@@ -174,11 +178,14 @@ static void coop_force(Val *ret, void *self, void *other, int argc, Val *args)
         *ret = undef();
         return;
     }
+    /* The friend's own shots, copied here for show, push nothing that is not ours to push. */
+    if (argc >= 4 && !puppetEvent && !puppet_bullet(other))
+        forward_push(self, other, value(args[2]) / 60, value(args[3]) / 60);
     forceOriginal(ret, self, other, argc, args);
 }
 static void coop_impulse(Val *ret, void *self, void *other, int argc, Val *args)
 {
-    if (puppet_on_player(self))
+    if (puppet_on_player(self, other))
     {
         *ret = undef();
         return;
@@ -190,6 +197,9 @@ static void coop_impulse(Val *ret, void *self, void *other, int argc, Val *args)
         *ret = undef();
         return;
     }
+    /* The friend's own shots, copied here for show, push nothing that is not ours to push. */
+    if (argc >= 4 && !puppetEvent && !puppet_bullet(other))
+        forward_push(self, other, value(args[2]), value(args[3]));
     impulseOriginal(ret, self, other, argc, args);
 }
 static void receive_pushes(void)
@@ -214,6 +224,11 @@ static void receive_pushes(void)
         dx *= 2 / size, dy *= 2 / size;
     Val r = undef(), args[] = {num(coord(player, B_x)), num(coord(player, B_y)), num(dx), num(dy)};
     impulseOriginal(&r, player, player, 4, args);
+}
+static void apply_push(void *p, double ix, double iy)
+{
+    Val r = undef(), args[] = {num(coord(p, B_x)), num(coord(p, B_y)), num(ix), num(iy)};
+    impulseOriginal(&r, p, p, 4, args);
 }
 static int install_push_hooks(void)
 {
@@ -253,6 +268,37 @@ static void webs_step(void *self)
 {
     receive_pushes();
     webs_on_me(self);
+}
+/* ---- Web nodes. A node holding exactly two straight strands that nobody hangs on merges them back
+   into one (oWebNode step). The friend's strands may only be merged by the friend's game: here the
+   friend is still hanging on that node, and a merge on our side would delete the strands under
+   them. Nodes on strands the friend owns skip their step here; the owner's result comes back
+   through the sync. ---- */
+static Event stepNode;
+static Table foreignNodes;
+static int foreignTick = -1;
+static void on_node_step(void *self, void *other)
+{
+    if (bus && bus->status == CONNECTED && same_room())
+    {
+        if (foreignTick != menuTick)
+        {
+            foreignTick = menuTick;
+            table_clear(&foreignNodes);
+            Iterator it;
+            void *web;
+            begin(&it, self, 107);
+            while ((web = next(&it)))
+                if (!owned_here(instance_id(web)))
+                {
+                    table_put(&foreignNodes, (int)value(*field(web, V_o)), 1);
+                    table_put(&foreignNodes, (int)value(*field(web, V_a)), 1);
+                }
+        }
+        if (table_get(&foreignNodes, instance_id(self), 0))
+            return;
+    }
+    stepNode(self, other);
 }
 static int install_web_hooks(void)
 {

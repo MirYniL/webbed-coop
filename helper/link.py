@@ -80,8 +80,8 @@ BODY_START = WORLD_HEADER.size + 1536 * STRAND.size
 WORLD_SIZE = BODY_START + 768 * BODY.size
 TIES_HEADER = struct.Struct("<2I")
 TIE_MAX = 96
-CUT_RING = 64
-CUT = struct.Struct("<2i2f")  # id, kind (0 remove, 1 split), x, y
+CUT_RING = 256
+CUT = struct.Struct("<2i2f")  # id, kind (0 remove, 1 split, 2 push), x, y
 CUTS_IN = 4 + CUT_RING * CUT.size
 CUTS_SIZE = CUTS_IN + 4 + CUT_RING * CUT.size
 TIES_SIZE = TIES_HEADER.size + TIE_MAX * STRAND.size
@@ -268,7 +268,7 @@ class Game:
             raise ValueError("Пакет разрезов")
         count = struct.unpack_from("<I", self.cutsmem, CUTS_IN)[0]
         for i, kind, x, y in CUT.iter_unpack(data):
-            if kind not in (0, 1) or not (math.isfinite(x) and math.isfinite(y)):
+            if kind not in (0, 1, 2) or not (math.isfinite(x) and math.isfinite(y)):
                 raise ValueError("Пакет разрезов")
             at = CUTS_IN + 4 + CUT.size * (count % CUT_RING)
             CUT.pack_into(self.cutsmem, at, i, kind, x, y)
@@ -367,6 +367,46 @@ class WorldMirror:
         return head + b"".join(self.strands.values()) + b"".join(self.bodies.values())
 
 
+class NetLog:
+    """QA only (WEBBED_COOP_NETLOG=file): once a second, bytes sent per kind, the slowest send
+    (time waiting for the socket) and the longest gap between received messages."""
+
+    def __init__(self, path):
+        self.path = path
+        self.reset()
+
+    def reset(self):
+        self.start = time.monotonic()
+        self.bytes = {}
+        self.slowest = 0
+        self.last_rx = None
+        self.gap = 0
+
+    def sent(self, kind, n, took):
+        self.bytes[kind] = self.bytes.get(kind, 0) + n
+        self.slowest = max(self.slowest, took)
+        self.flush()
+
+    def got(self):
+        now = time.monotonic()
+        if self.last_rx is not None:
+            self.gap = max(self.gap, now - self.last_rx)
+        self.last_rx = now
+
+    def flush(self):
+        if time.monotonic() - self.start < 1:
+            return
+        kinds = " ".join(f"{k.decode()}={v}" for k, v in sorted(self.bytes.items()))
+        with open(self.path, "a", encoding="utf8") as f:
+            f.write(f"{time.time():.1f} {kinds} slowest_send={self.slowest*1000:.0f}ms rx_gap={self.gap*1000:.0f}ms" + chr(10))
+        last = self.last_rx
+        self.reset()
+        self.last_rx = last
+
+
+NETLOG = NetLog(os.environ["WEBBED_COOP_NETLOG"]) if os.environ.get("WEBBED_COOP_NETLOG") else None
+
+
 class Wire:
     def __init__(self, r, w, key):
         self.r = r
@@ -383,11 +423,16 @@ class Wire:
             body = kind + payload
             header = struct.pack("!IQ", len(body), self.tx)
             mac = hmac.digest(self.key, header + body, "sha256")
+            started = time.monotonic()
             self.w.write(header + mac + body)
             await self.w.drain()
+            if NETLOG:
+                NETLOG.sent(kind, len(body) + 44, time.monotonic() - started)
 
     async def recv(self):
         hdr = await self.r.readexactly(12)
+        if NETLOG:
+            NETLOG.got()
         n, seq = struct.unpack("!IQ", hdr)
         if not 1 <= n <= LIMIT or seq != self.rx + 1:
             raise ValueError("Кадр другой версии")
@@ -1143,6 +1188,18 @@ async def link(pid, profile=None):
             t.result()
     except (OSError, ValueError, TimeoutError, asyncio.IncompleteReadError) as exc:
         message = str(exc)[:85] or "Связь с другом потеряна"
+        if NETLOG:
+            import traceback
+
+            with open(NETLOG.path, "a", encoding="utf8") as f:
+                traceback.print_exc(file=f)
+    except BaseException:
+        if NETLOG:
+            import traceback
+
+            with open(NETLOG.path, "a", encoding="utf8") as f:
+                traceback.print_exc(file=f)
+        raise
     finally:
         for t in (a, b):
             t.cancel()

@@ -443,7 +443,7 @@ static int owned_here(int id)
 }
 /* ---- Cuts: strand ids for the other side to remove. The game appends to "out", the network
    helper to "in"; each side only ever moves its own counter forward. ---- */
-#define CUT_RING 64
+#define CUT_RING 256
 typedef struct
 {
     int32_t id, kind; /* CUT_REMOVE, or CUT_SPLIT at (x, y) with the game's own split_web */
@@ -452,7 +452,8 @@ typedef struct
 enum
 {
     CUT_REMOVE,
-    CUT_SPLIT
+    CUT_SPLIT,
+    CUT_PUSH /* an impulse (x, y) for a body the host owns */
 };
 typedef struct
 {
@@ -475,6 +476,14 @@ static void send_cut_ex(int id, int kind, double x, double y)
     if (!cutsData)
         return;
     cutsData->out[cutsData->outCount % CUT_RING] = (Cut){id, kind, (float)x, (float)y};
+#ifdef NET_QA
+    if (kind != CUT_PUSH)
+    {
+        char l[120];
+        snprintf(l, 120, "CUTSEND t=%d id=%d kind=%d", menuTick, id, kind);
+        log_line(l);
+    }
+#endif
     MemoryBarrier();
     cutsData->outCount++;
 }
@@ -497,6 +506,85 @@ static void request_split(int id, double x, double y)
             send_cut_ex(webBindings[i].host, CUT_SPLIT, x, y);
 }
 static void split_here(void *self, int id, double x, double y);
+static void hold(int id);
+/* Our game changes a strand the friend owns: from now on it is ours, and the friend drops theirs. */
+static void take_over(int id)
+{
+    if (bus->role == GUEST)
+    {
+        for (int i = 0; i < webCount; i++)
+            if (webBindings[i].local == id)
+            {
+                send_cut(webBindings[i].host);
+                hold(webBindings[i].host);
+                webBindings[i] = webBindings[--webCount];
+                break;
+            }
+        if (!is_own(id) && ownCount < OWN_MAX)
+            ownIds[ownCount++] = id;
+        return;
+    }
+    for (int j = 0; j < tieIdCount; j++)
+        if (tieIds[j] == id)
+        {
+            send_cut(tieSource[j]);
+            hold(tieSource[j]);
+            tieIdCount--;
+            tieIds[j] = tieIds[tieIdCount], tieSource[j] = tieSource[tieIdCount];
+            tieO[j] = tieO[tieIdCount], tieA[j] = tieA[tieIdCount];
+            break;
+        }
+}
+static void apply_push(void *p, double ix, double iy);
+/* The host id of a body we only mirror (guest): placed objects keep their id, web nodes are bound. */
+static int host_body(void *p)
+{
+    int id = instance_id(p), t = object_type(p);
+    if (t == 101 || t == 105 || t == 106)
+    {
+        for (int i = 0; i < nodeCount; i++)
+            if (nodeBindings[i].local == id)
+                return nodeBindings[i].host;
+        return 0;
+    }
+    return id <= LAST_PLACED_ID && mobile_type(t) ? id : 0;
+}
+/* Pushes this frame, summed per body and sent once per frame. */
+typedef struct
+{
+    int id;
+    double x, y;
+} Push;
+static Push pushes[32];
+static int pushCount;
+static int own_bullet(void *p);
+static void forward_push(void *self, void *other, double ix, double iy)
+{
+    /* Only what our spider does (its step: walking on webs, pulling with the grapple) or its shots;
+       a body's own forces (web nodes pulling on each other) the host computes itself. */
+    if (!playerEvent && !own_bullet(other))
+        return;
+    if (!bus || bus->role != GUEST || bus->status != CONNECTED || !self || self == player || self == remote ||
+        !same_room() || !isfinite(ix) || !isfinite(iy))
+        return;
+    int host = host_body(self);
+    if (!host)
+        return;
+    for (int i = 0; i < pushCount; i++)
+        if (pushes[i].id == host)
+        {
+            pushes[i].x += ix, pushes[i].y += iy;
+            return;
+        }
+    if (pushCount < 32)
+        pushes[pushCount++] = (Push){host, ix, iy};
+}
+static void flush_pushes(void)
+{
+    for (int i = 0; i < pushCount; i++)
+        send_cut_ex(pushes[i].id, CUT_PUSH, pushes[i].x, pushes[i].y);
+    pushCount = 0;
+}
 /* A strand just cut here stays cut while the owner hears about it (a round trip or two). */
 static void hold(int id)
 {
@@ -527,6 +615,22 @@ static void receive_cuts(void *self)
     {
         Cut c = cutsData->in[cutsSeen % CUT_RING];
         void *p = find_id(self, c.id);
+#ifdef NET_QA
+        if (c.kind != CUT_PUSH)
+        {
+            char l[160];
+            snprintf(l, 160, "CUTRECV t=%d id=%d kind=%d found=%d type=%d owned=%d", menuTick, c.id, c.kind, p != NULL,
+                     p ? object_type(p) : -1, owned_here(c.id));
+            log_line(l);
+        }
+#endif
+        if (c.kind == CUT_PUSH)
+        {
+            if (p && bus->role == HOST && isfinite(c.x) && isfinite(c.y) && fabs(c.x) + fabs(c.y) < 1e4 &&
+                object_type(p) != 94 && object_type(p) != 107 && value(FN(self, instance_exists, num(c.id))))
+                apply_push(p, c.x, c.y);
+            continue;
+        }
         /* Only the owner's copy changes: the guest's own webs, or the host's world. */
         if (!p || object_type(p) != 107 || !owned_here(c.id) || !value(FN(self, instance_exists, num(c.id))))
             continue;
@@ -876,6 +980,7 @@ static void apply_world(void *self)
 static void sync_world(void *self)
 {
     expire_provisional(self);
+    flush_pushes();
     if (bus->role)
         receive_cuts(self);
     if (bus->role == GUEST && bus->status == CONNECTED)
